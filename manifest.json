@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "nishant.tidy",
+  "name": "Tidy",
+  "version": "1.0.0",
+  "author": "nishant",
+  "description": "BleachBit-style system cleaner: reclaim space from logs, caches, packages and leftovers",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Tidy",
+    "description": "Free up disk space, safely",
+    "category": "System",
+    "defaultSection": "right",
+    "allowMultiple": false
+  }
+}

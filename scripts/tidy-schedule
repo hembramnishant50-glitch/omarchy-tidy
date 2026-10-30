@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+# tidy-schedule — the background cleanup, wired to a systemd user timer.
+#
+#   tidy-schedule status             is the timer on, and when does it next fire
+#   tidy-schedule enable [daily|weekly]
+#   tidy-schedule disable
+#   tidy-schedule run                what the timer actually executes
+#
+# The timer runs the conservative cleaner set — the same set the one-click
+# button uses — because a scheduled job has nobody to answer a polkit prompt.
+# Everything in that set lives in the user's home, so the job never needs
+# root, and it never touches anything that is not rebuilt on demand.
+
+set -uo pipefail
+
+DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=tidy-lib.sh
+. "$DIR/tidy-lib.sh"
+
+UNIT_DIR="${XDG_CONFIG_HOME:-$TIDY_HOME/.config}/systemd/user"
+TIMER_FILE="$UNIT_DIR/tidy.timer"
+SERVICE_FILE="$UNIT_DIR/tidy.service"
+TIMER_UNIT="tidy.timer"
+SERVICE_UNIT="tidy.service"
+
+# ------------------------------------------------------------------- systemd
+_have_systemctl() { command -v systemctl >/dev/null 2>&1; }
+
+# The user manager has to be reachable before any of this means anything. On a
+# machine without one (a bare tty session, a container) the panel says so
+# instead of offering a switch that does nothing.
+_manager_ok() {
+  _have_systemctl || return 1
+  systemctl --user show -p Version --value >/dev/null 2>&1
+}
+
+_ctl() { systemctl --user "$@" >/dev/null 2>&1; }
+
+_control() {
+  if _manager_ok; then echo yes; else echo no; fi
+}
+
+# The cadence is the timer's OnCalendar value; `weekly` and `daily` are systemd
+# shorthands, so there is nothing to translate between here and the unit file.
+_current_cadence() {
+  [ -f "$TIMER_FILE" ] || return 1
+  sed -n 's/^OnCalendar=//p' "$TIMER_FILE" 2>/dev/null | head -1
+}
+
+# A unit file remembers the absolute path of the script that wrote it. Move the
+# plugin and the timer keeps firing at a path that no longer exists, so status
+# reports the drift rather than letting it fail silently at 3am.
+_unit_stale() {
+  [ -f "$SERVICE_FILE" ] || return 1
+  local want="ExecStart=$DIR/tidy-clean"
+  grep -qF -- "$want" "$SERVICE_FILE" 2>/dev/null && return 1
+  return 0
+}
+
+cmd_status() {
+  local available enabled=no active=no next="" last="" cadence="" stale=no
+  available="$(_control)"
+
+  if [ "$available" = yes ]; then
+    _ctl is-enabled "$TIMER_UNIT" && enabled=yes
+    _ctl is-active "$TIMER_UNIT" && active=yes
+    cadence="$(_current_cadence || true)"
+
+    # NextElapseUSecRealtime is the wall-clock instant the timer will fire;
+    # LastTriggerUSec is history. Either may come back as "n/a" or as the
+    # infinities systemd uses for "never", so both are passed through as text.
+    next="$(systemctl --user show -p NextElapseUSecRealtime --value "$TIMER_UNIT" 2>/dev/null)"
+    last="$(systemctl --user show -p LastTriggerUSec --value "$TIMER_UNIT" 2>/dev/null)"
+    case "$next" in "" | n/a | *infinity*) next="" ;;
+    esac
+    case "$last" in "" | n/a | *infinity*) last="" ;;
+    esac
+    _unit_stale && stale=yes
+  fi
+
+  printf '{"ok":true,"available":%s,"enabled":%s,"active":%s,"cadence":"%s","next":"%s","last":"%s","stale":%s,"path":"%s"}\n' \
+    "$([ "$available" = yes ] && echo true || echo false)" \
+    "$([ "$enabled" = yes ] && echo true || echo false)" \
+    "$([ "$active" = yes ] && echo true || echo false)" \
+    "$(_json_escape "${cadence:-weekly}")" "$(_json_escape "$next")" \
+    "$(_json_escape "$last")" \
+    "$([ "$stale" = yes ] && echo true || echo false)" \
+    "$(_json_escape "$SERVICE_FILE")"
+}
+
+# ------------------------------------------------------------------- writing
+_write_units() {
+  local cadence="$1"
+  mkdir -p "$UNIT_DIR" 2>/dev/null || return 1
+
+  cat >"$SERVICE_FILE" <<EOF
+[Unit]
+Description=Tidy background cleanup
+
+[Service]
+Type=oneshot
+ExecStart=$DIR/tidy-clean --safe --notify
+# A cleanup is the definition of work that should never compete for the CPU or
+# the disk with whatever the person is actually doing.
+Nice=10
+IOSchedulingClass=idle
+EOF
+
+  cat >"$TIMER_FILE" <<EOF
+[Unit]
+Description=Run Tidy's conservative cleanup
+
+[Timer]
+OnCalendar=$cadence
+Persistent=true
+RandomizedDelaySec=30min
+AccuracySec=5min
+
+[Install]
+WantedBy=timers.target
+EOF
+  return 0
+}
+
+cmd_enable() {
+  local cadence="${1:-weekly}"
+  case "$cadence" in
+    daily | weekly) ;;
+    *)
+      printf '{"ok":false,"error":"cadence must be daily or weekly"}\n'
+      return 2
+      ;;
+  esac
+
+  if ! _have_systemctl; then
+    printf '{"ok":false,"error":"systemctl is not available"}\n'
+    return 1
+  fi
+  if ! _manager_ok; then
+    printf '{"ok":false,"error":"no systemd user session to schedule into"}\n'
+    return 1
+  fi
+
+  _write_units "$cadence" || {
+    printf '{"ok":false,"error":"could not write %s"}\n' "$(_json_escape "$UNIT_DIR")"
+    return 1
+  }
+
+  _ctl daemon-reload
+  # `enable --now` leaves an already-running timer alone, so re-enabling to
+  # change the cadence still needs the restart to pick up the new schedule.
+  if ! _ctl enable "$TIMER_UNIT"; then
+    printf '{"ok":false,"error":"systemd refused to enable %s"}\n' "$TIMER_UNIT"
+    return 1
+  fi
+  _ctl restart "$TIMER_UNIT"
+  command -v systemd-analyze >/dev/null 2>&1 && systemd-analyze --user verify "$TIMER_FILE" >/dev/null 2>&1
+
+  cmd_status
+}
+
+cmd_disable() {
+  if _have_systemctl && _manager_ok; then
+    _ctl disable --now "$TIMER_UNIT"
+  fi
+  rm -f -- "$TIMER_FILE" "$SERVICE_FILE" 2>/dev/null
+  _ctl daemon-reload
+  cmd_status
+}
+
+# What the timer runs. Kept here rather than in the unit file so the same code
+# path can be triggered by hand from a terminal.
+cmd_run() {
+  exec "$DIR/tidy-clean" --safe --notify
+}
+
+# ---------------------------------------------------------------------- main
+case "${1:-status}" in
+  status) cmd_status ;;
+  enable) cmd_enable "${2:-weekly}" ;;
+  disable) cmd_disable ;;
+  run) cmd_run ;;
+  *)
+    echo "usage: tidy-schedule status|enable [daily|weekly]|disable|run" >&2
+    exit 2
+    ;;
+esac

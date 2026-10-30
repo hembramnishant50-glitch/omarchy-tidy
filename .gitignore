@@ -1,0 +1,8 @@
+# Python bytecode from fine-tune-state tooling
+__pycache__/
+*.pyc
+
+# editor droppings
+*.swp
+.vscode/
+.idea/

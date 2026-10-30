@@ -1,0 +1,1188 @@
+#!/usr/bin/env bash
+# tidy-uninstall — list installed applications and remove one completely.
+#
+# Usage:
+#   tidy-uninstall list
+#   tidy-uninstall preview <id>
+#   tidy-uninstall run     <id>... [--shred] [--force]
+#   tidy-uninstall scan    <id> [display-name]
+#   tidy-uninstall wipe    [--shred|--rm] <path>...
+#
+# An <id> is "<source>:<name>", where source is pacman, aur or flatpak.
+#
+# `run` accepts more than one id: each package keeps its own restore point and
+# its own result line, and the whole batch is one line on the History tab.
+# Every package is its own elevated call — polkit caches the authorisation, so
+# the user is asked once — but a partial failure still names the package that
+# failed instead of sinking the batch.
+#
+# "Completely" means: the package itself, the dependencies pacman no longer
+# needs, and the configuration / cache / state / data directories the package
+# left behind in the user's home and in the system tree. A leftover is only
+# ever removed when it is conclusively the application's and no installed
+# package owns it; an entry that merely resembles the application's name is
+# reported for the reviewed scan instead, and a shared path such as /etc or
+# /usr/lib is never touched.
+
+set -uo pipefail
+
+TIDY_LIB_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=tidy-lib.sh
+. "$TIDY_LIB_DIR/tidy-lib.sh"
+
+TIDY_SHRED="${TIDY_SHRED:-0}"
+
+# --------------------------------------------------------------- identifiers
+_split_id() {
+  TIDY_UN_SOURCE="${1%%:*}"
+  TIDY_UN_NAME="${1#*:}"
+  [ "$TIDY_UN_NAME" = "$1" ] && TIDY_UN_SOURCE="pacman"
+}
+
+# A package name or flatpak id is a plain token. Anything else that slips in —
+# an unexpanded shell argument, or a flag that pacman would happily accept as
+# one of its own (`run --help` asks pacman for its help text, watches it exit
+# 0, and reports the package removed) — is turned away at the door, keeping
+# every pacman and flatpak call below flag-safe.
+_valid_app_name() {
+  case "$1" in
+    "" | -* | *[!A-Za-z0-9_@.+.-]*) return 1 ;;
+  esac
+  return 0
+}
+
+# Every plausible directory basename a package may use. A binary named
+# `brave` usually keeps its state in ~/.config/brave even when the package is
+# called brave-bin, so the executable and .desktop names are as important as
+# the package name itself.
+#
+# Only the names on PATH and on the application menu count. A file inside the
+# package is not a name it goes by: a module called fontconfig.py in an
+# application's private library means it uses fontconfig, not that
+# ~/.cache/fontconfig belongs to it. Reading every library basename turned one
+# shared cache directory into a "leftover" of whatever happened to ship a file
+# with that name, and a leftover is something Tidy may delete.
+_leftover_names() {
+  local pkg="$1"
+  {
+    printf '%s\n' "$pkg"
+    pacman -Qlq "$pkg" 2>/dev/null | awk -F/ '
+      /\/usr\/bin\/[^/]+$/ || /\/usr\/sbin\/[^/]+$/ ||
+      /\/usr\/local\/bin\/[^/]+$/ || /\/usr\/local\/sbin\/[^/]+$/ { print $NF }
+      /\/usr\/share\/applications\/.*\.desktop$/ { n = $NF; sub(/\.desktop$/, "", n); print n }
+    '
+  } | sed -E 's/\.(sh|py|pl|rb)$//' | awk 'length($0) >= 3' | sort -u
+}
+
+_leftover_roots() {
+  printf '%s\n' \
+    "$TIDY_HOME/.config" \
+    "$TIDY_HOME/.local/share" \
+    "$TIDY_HOME/.local/state" \
+    "$TIDY_HOME/.cache" \
+    /etc \
+    /var/lib \
+    /var/cache \
+    /opt
+}
+
+# Paths in the standard locations whose names the application answers to and
+# that no installed package owns. Each line is a verdict and a path —
+# "<exact|near>\t<path>" — because the caller has to treat the two very
+# differently: only a conclusive match is removed unattended, while a
+# name-similar one is reported for the reviewed scan. Which names are
+# conclusive is decided by _scan_exact, the same rule the scan uses to decide
+# what to preselect. Order is stable so the UI does not jump between renders.
+_leftover_paths() {
+  local pkg="$1" root entry base names kind
+  names="$(_leftover_names "$pkg")"
+  [ -n "$names" ] || return 0
+  while IFS= read -r root; do
+    [ -d "$root" ] || continue
+    while IFS= read -r entry; do
+      [ -n "$entry" ] || continue
+      base="${entry##*/}"
+      if _scan_exact "$base" "$names"; then
+        kind="exact"
+      elif _scan_fuzzy "$base" "$names"; then
+        kind="near"
+      else
+        continue
+      fi
+      # Owned by a package (this one or any other) => pacman's job, not ours.
+      pacman -Qo -- "$entry" >/dev/null 2>&1 && continue
+      [ -L "$entry" ] || [ -e "$entry" ] || continue
+      printf '%s\t%s\n' "$kind" "$entry"
+    done < <(find "$root" -mindepth 1 -maxdepth 1 -printf '%p\n' 2>/dev/null | sort)
+  done < <(_leftover_roots)
+}
+
+# ------------------------------------------------------------- provenance
+# Packages that arrive with an Omarchy install. The lists ship inside the
+# omarchy package, so they track the system; the installer scripts add the
+# machine-specific drivers on top of them.
+declare -A TIDY_OMARCHY_PKGS=()
+TIDY_PKGS_READY=0
+
+_tidy_load_pkg_sets() {
+  [ "$TIDY_PKGS_READY" = 1 ] && return 0
+  local line word
+  while IFS= read -r line; do
+    line="${line%%#*}"
+    for word in $line; do
+      # Only clean tokens can be package names; this drops the shell syntax
+      # around the installer's omarchy-pkg-add calls.
+      case "$word" in
+        '' | *[!A-Za-z0-9@._+-]*) continue ;;
+        omarchy-pkg-add) continue ;;
+      esac
+      TIDY_OMARCHY_PKGS["$word"]=1
+    done
+  done < <(
+    cat /usr/share/omarchy/install/omarchy-base.packages \
+      /usr/share/omarchy/install/omarchy-other.packages 2>/dev/null
+    grep -rh -- 'omarchy-pkg-add' /usr/share/omarchy/install 2>/dev/null
+  )
+
+  # Arrive with Omarchy but are named nowhere in the install lists, so the
+  # scan above cannot see them. Omarchy ships kitty's config and treats it as
+  # a system terminal, its Vulkan hardware step pulls vulkan-tools in beside
+  # the driver, and Brave Origin / Voxtype come from Omarchy's own "install a
+  # browser" and "install dictation" menus. They belong to the Omarchy set,
+  # not to the user's own picks.
+  local curated=(kitty kitty-shell-integration kitty-terminfo vulkan-tools
+    voxtype-bin brave-bin brave-origin-bin)
+  for word in "${curated[@]}"; do TIDY_OMARCHY_PKGS["$word"]=1; done
+
+  # A bare Arch install: the ISO and the installer bring these in, so they are
+  # no more the user's own doing than Omarchy's packages are. They go into the
+  # same set rather than a third bucket — "ships with the system" and "ships
+  # with Omarchy" are not a distinction anyone standing in front of the
+  # uninstaller can act on, and keeping them apart put `limine` under Omarchy
+  # while `efibootmgr`, its own boot-entry tool, sat in a section of four.
+  local essentials=(base base-devel pacman filesystem glibc systemd sudo mkinitcpio
+    efibootmgr grub limine refind os-prober linux linux-lts linux-zen linux-hardened
+    linux-firmware)
+  for word in "${essentials[@]}"; do TIDY_OMARCHY_PKGS["$word"]=1; done
+  TIDY_PKGS_READY=1
+}
+
+# Sets TIDY_UN_CATEGORY to omarchy | user. Two buckets, not three: everything
+# the installer or the image put there counts as Omarchy's, and only the user's
+# own picks are "user". Writing to a global keeps this out of a subshell, which
+# matters when it runs once per package.
+TIDY_UN_CATEGORY="user"
+_pkg_category() {
+  local name="$1"
+  _tidy_load_pkg_sets
+  case "$name" in
+    omarchy | omarchy-*) TIDY_UN_CATEGORY="omarchy"; return 0 ;;
+    # CPU microcode always arrives with the machine image, never with the user.
+    *-ucode) TIDY_UN_CATEGORY="omarchy"; return 0 ;;
+  esac
+  if [ -n "${TIDY_OMARCHY_PKGS[$name]:-}" ]; then
+    TIDY_UN_CATEGORY="omarchy"
+  else
+    TIDY_UN_CATEGORY="user"
+  fi
+}
+
+_is_user_path() {
+  case "$1" in
+    "$TIDY_HOME"/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# -------------------------------------------------------------- app metadata
+# Real icons, a "last used" hint and a running-or-not flag all come from the
+# same three cheap facts: the files a package owns, what its desktop entry
+# calls itself, and which binaries are alive right now. They are gathered once
+# for the whole list rather than forked per row.
+#
+# `pacman -Ql` with no arguments prints half a million lines in well under a
+# second and answers the whole question, so the awk pass below is the cost.
+
+_TIDY_META_READY=0
+declare -A TIDY_ICON=() TIDY_BIN=() TIDY_DESKTOP=() TIDY_LASTUSED=() TIDY_LIVE=()
+
+_tidy_load_meta() {
+  [ "$_TIDY_META_READY" = 1 ] && return 0
+  _TIDY_META_READY=1
+
+  # One pass picks, per package, the most representative binary and desktop
+  # file: an exact name match beats anything else, an application entry beats
+  # an autostart stub, and the first hit is the tie-breaker.
+  local pkg kind path line
+  local -a desktops=()
+  while IFS=$'\t' read -r pkg kind path; do
+    [ -n "$pkg" ] || continue
+    case "$kind" in
+      bin) TIDY_BIN[$pkg]="$path" ;;
+      desk)
+        TIDY_DESKTOP[$pkg]="$path"
+        desktops+=("$path")
+        ;;
+    esac
+  done < <(pacman -Ql 2>/dev/null | awk '
+    function base(p,   n, a) { n = split(p, a, "/"); return a[n] }
+    {
+      pkg = $1
+      if (index($0, "bin/") == 0 && index($0, ".desktop") == 0) next
+      if (NF == 2) p = $2
+      else { p = $0; sub(/^[^[:space:]]+[[:space:]]+/, "", p) }
+      if (p ~ /\.desktop$/) {
+        bn = base(p); sub(/\.desktop$/, "", bn)
+        if (!(pkg in d)) d[pkg] = p
+        if (!(pkg in dp) && p !~ /\/autostart\//) dp[pkg] = p
+        if (!(pkg in de) && bn == pkg) de[pkg] = p
+        next
+      }
+      if (p ~ /\/(usr\/bin|usr\/sbin|usr\/local\/bin)\/[^\/]+$/) {
+        if (!(pkg in b)) b[pkg] = p
+        if (!(pkg in be) && base(p) == pkg) be[pkg] = p
+      }
+    }
+    END {
+      for (k in b) print k "\tbin\t" ((k in be) ? be[k] : b[k])
+      for (k in d) print k "\tdesk\t" ((k in de) ? de[k] : ((k in dp) ? dp[k] : d[k]))
+    }')
+
+  # `Icon=` is the name a theme resolves; the desktop file's own basename is
+  # the fallback when an entry names nothing usable.
+  if [ "${#desktops[@]}" -gt 0 ]; then
+    local -A icon_of=()
+    local d i
+    while IFS= read -r line; do
+      case "$line" in
+        *:Icon=*)
+          d="${line%%:Icon=*}"
+          i="${line#*:Icon=}"
+          [ -n "$d" ] && [ -n "$i" ] && icon_of["$d"]="$i"
+          ;;
+      esac
+    done < <(grep -H -m1 '^Icon=' -- "${desktops[@]}" 2>/dev/null)
+    for pkg in "${!TIDY_DESKTOP[@]}"; do
+      d="${TIDY_DESKTOP[$pkg]}"
+      TIDY_ICON[$pkg]="${icon_of[$d]:-}"
+      [ -n "${TIDY_ICON[$pkg]}" ] || TIDY_ICON[$pkg]="$(basename -- "$d" .desktop)"
+    done
+  fi
+
+  # Last used is the most recent access time across the desktop entry and the
+  # binary. `relatime` only rewrites an atime that is already a day or more
+  # stale, so this is a floor rather than a stopwatch — the UI says so.
+  local -a mfiles=()
+  local -A pkg_of=()
+  for pkg in "${!TIDY_BIN[@]}"; do
+    mfiles+=("${TIDY_BIN[$pkg]}")
+    pkg_of["${TIDY_BIN[$pkg]}"]="$pkg"
+  done
+  for pkg in "${!TIDY_DESKTOP[@]}"; do
+    mfiles+=("${TIDY_DESKTOP[$pkg]}")
+    pkg_of["${TIDY_DESKTOP[$pkg]}"]="$pkg"
+  done
+  if [ "${#mfiles[@]}" -gt 0 ]; then
+    local at
+    while read -r at path; do
+      pkg="${pkg_of[$path]:-}"
+      [ -n "$pkg" ] || continue
+      case "$at" in '' | *[!0-9]*) continue ;; esac
+      [ "${TIDY_LASTUSED[$pkg]:-0}" -lt "$at" ] && TIDY_LASTUSED[$pkg]="$at"
+    done < <(stat -c '%X %n' -- "${mfiles[@]}" 2>/dev/null)
+  fi
+
+  local c
+  while IFS= read -r c; do
+    [ -n "$c" ] && TIDY_LIVE["$c"]=1
+  done < <(ps -eo comm= 2>/dev/null)
+  return 0
+}
+
+# Is anything from this package on screen right now? Pulling a live binary out
+# from under its own window is how an uninstall corrupts a profile, so the
+# answer decides whether the uninstaller refuses or asks.
+_tidy_running() {
+  local name="$1" b
+  _tidy_load_meta
+  b="${TIDY_BIN[$name]:-}"
+  if [ -n "$b" ] && [ -n "${TIDY_LIVE[$(basename -- "$b")]:-}" ]; then return 0; fi
+  [ -n "${TIDY_LIVE[$name]:-}" ] && return 0
+  return 1
+}
+
+_flatpak_running() {
+  command -v flatpak >/dev/null 2>&1 || return 1
+  flatpak ps --columns=application 2>/dev/null | grep -qxF -- "$1"
+}
+
+# Flatpak's exported entry point is the only timestamp it has; the app's own
+# data directory is a serviceable second best.
+_flatpak_last_used() {
+  local app="$1" p best=0 at
+  for p in \
+    "$TIDY_HOME/.local/share/flatpak/exports/share/applications/$app.desktop" \
+    "/var/lib/flatpak/exports/share/applications/$app.desktop" \
+    "$TIDY_HOME/.var/app/$app"; do
+    [ -e "$p" ] || continue
+    at="$(stat -c %X -- "$p" 2>/dev/null)"
+    case "$at" in '' | *[!0-9]*) continue ;; esac
+    [ "$at" -gt "$best" ] && best="$at"
+  done
+  echo "$best"
+}
+
+# A path deserves a restore point when it lives under the home directory and is
+# not a cache: copying back a cache would cost disk space to restore something
+# the application rebuilds on its next start anyway.
+_tidy_backupable() {
+  local p="${1%/}"
+  case "$p" in
+    "$TIDY_HOME"/*) ;;
+    *) return 1 ;;
+  esac
+  case "$p" in
+    "$TIDY_HOME/.cache" | "$TIDY_HOME/.cache"/*) return 1 ;;
+  esac
+  return 0
+}
+
+# Archive the configuration an uninstall is about to delete, and print the
+# timestamp of the restore point. Nothing is printed when there is nothing
+# worth keeping or the archive would be unreasonably large.
+_undo_create() {
+  local id="$1" name="$2" source="$3"
+  shift 3
+  [ -x "$TIDY_STATE" ] || return 1
+  local -a paths=() p
+  for p in "$@"; do
+    [ -e "$p" ] || continue
+    _tidy_backupable "$p" || continue
+    paths+=("$p")
+  done
+  [ "${#paths[@]}" -gt 0 ] || return 1
+  local out
+  out="$("$TIDY_STATE" undo-create "$id" "$name" "$source" "${paths[@]}" 2>/dev/null)"
+  case "$out" in
+    *'"ok":true'*) printf '%s' "$out" | sed -n 's/.*"at":\([0-9][0-9]*\).*/\1/p' ;;
+    *) return 1 ;;
+  esac
+}
+
+_undo_drop() {
+  [ -n "${1:-}" ] || return 0
+  [ -x "$TIDY_STATE" ] && "$TIDY_STATE" undo-drop "$1" >/dev/null 2>&1
+  return 0
+}
+
+# ---------------------------------------------------------------------- list
+cmd_list() {
+  local first=1 name ver size desc source foreign category
+  local icon="" lastused=0 running=false pkg_list f
+  foreign="$(pacman -Qmq 2>/dev/null)"
+  pkg_list="$(pacman -Qeq 2>/dev/null)"
+
+  # The foreign list arrives once as a set instead of as a grep per row.
+  local -A is_foreign=()
+  while IFS= read -r f; do
+    [ -n "$f" ] && is_foreign["$f"]=1
+  done <<< "$foreign"
+
+  # One metadata pass for the whole list: icons, last-used and the process
+  # table all come out of it.
+  [ -n "$pkg_list" ] && _tidy_load_meta
+
+  local fl_running=""
+  command -v flatpak >/dev/null 2>&1 && fl_running="$(flatpak ps --columns=application 2>/dev/null)"
+
+  printf '{"ok":true,"apps":['
+
+  while IFS=$'\t' read -r name ver size desc; do
+    [ -n "$name" ] || continue
+    if [ -n "${is_foreign[$name]:-}" ]; then source="aur"; else source="pacman"; fi
+    _pkg_category "$name"
+    category="$TIDY_UN_CATEGORY"
+    icon="${TIDY_ICON[$name]:-}"
+    lastused="${TIDY_LASTUSED[$name]:-0}"
+    if _tidy_running "$name"; then running=true; else running=false; fi
+    [ "$first" = 1 ] || printf ','
+    first=0
+    # Only the free-text fields go through the escaper: package names, versions
+    # and sources cannot contain a character JSON cares about, and every
+    # substitution is a fork, so the loop stays quick by paying for the two that
+    # can.
+    printf '{"id":"%s:%s","name":"%s","version":"%s","size":%s,"desc":"%s","source":"%s","category":"%s","icon":"%s","lastUsed":%s,"running":%s}' \
+      "$source" "$name" "$name" \
+      "$ver" "${size:-0}" "$(_json_escape "$desc")" "$source" "$category" \
+      "$(_json_escape "$icon")" "$lastused" "$running"
+  done < <(
+  # expac is a separate package and may not be installed; pacman itself can
+  # still answer for version through -Q. Listing every explicit package with a
+  # blank size and description beats dropping the whole tab silently.
+  if command -v expac >/dev/null 2>&1; then
+    expac -Q '%n\t%v\t%m\t%d' $pkg_list
+  else
+    printf '%s\n' "$pkg_list" | awk '
+      { explicit[$1] = 1 }
+      END {
+        cmd = "pacman -Q 2>/dev/null"
+        while ((cmd | getline line) > 0) {
+          split(line, f, " ")
+          if (f[1] in explicit)
+            printf "%s\t%s\t0\t\n", f[1], f[2]
+        }
+        close(cmd)
+      }'
+  fi
+)
+
+  if command -v flatpak >/dev/null 2>&1; then
+    while IFS=$'\t' read -r app appname ver origin install; do
+      [ -n "$app" ] || continue
+      size="$(flatpak info --show-size "$app" 2>/dev/null)"
+      case "$size" in '' | *[!0-9]*) size=0 ;; esac
+      # The exported icon is named after the app id, which is also what a theme
+      # lookup resolves, so the id doubles as the icon reference.
+      lastused="$(_flatpak_last_used "$app")"
+      if printf '%s\n' "$fl_running" | grep -qxF -- "$app"; then running=true; else running=false; fi
+      [ "$first" = 1 ] || printf ','
+      first=0
+      # The remote tells the user where it came from — almost always flathub.
+      printf '{"id":"flatpak:%s","name":"%s","version":"%s","size":%s,"desc":"Flatpak application","source":"flatpak","category":"user","remote":"%s","installation":"%s","icon":"%s","lastUsed":%s,"running":%s}' \
+        "$app" "$(_json_escape "$appname")" \
+        "$ver" "$size" "$(_json_escape "${origin:-flathub}")" \
+        "${install:-user}" "$app" "$lastused" "$running"
+    done < <(flatpak list --app --columns=application,name,version,origin,installation 2>/dev/null)
+  fi
+
+  printf ']}\n'
+}
+
+# ------------------------------------------------------------------- preview
+cmd_preview() {
+  local id="$1"
+  _split_id "$id"
+  if ! _valid_app_name "$TIDY_UN_NAME"; then
+    printf '{"ok":false,"error":"invalid id"}\n'
+    return 2
+  fi
+  local source="$TIDY_UN_SOURCE" name="$TIDY_UN_NAME"
+  local size=0 desc="" version="" deps="" requiredBy="" files=0 leftovers="" leftover_bytes=0
+  local remote="" install="" category="user" display="$TIDY_UN_NAME"
+  local path bytes scope kind
+  local config_bytes=0 plan="" plan_count=0 icon="" lastused=0 running=false near_count=0
+  local -a lpaths=() lbytes=() lscope=()
+
+  case "$source" in
+    flatpak)
+      size="$(flatpak info --show-size "$name" 2>/dev/null)"
+      case "$size" in '' | *[!0-9]*) size=0 ;; esac
+      version="$(flatpak list --app --columns=application,version 2>/dev/null \
+        | awk -F'\t' -v app="$name" '$1 == app { print $2; exit }')"
+      remote="$(flatpak list --app --columns=application,origin 2>/dev/null | awk -F'\t' -v app="$name" '$1 == app { print $2; exit }')"
+      install="$(flatpak list --app --columns=application,installation 2>/dev/null | awk -F'\t' -v app="$name" '$1 == app { print $2; exit }')"
+      desc="Flatpak application"
+      display="$(flatpak list --app --columns=application,name 2>/dev/null \
+        | awk -F'\t' -v app="$name" '$1 == app { print $2; exit }')"
+      [ -n "$display" ] || display="$name"
+      icon="$name"
+      lastused="$(_flatpak_last_used "$name")"
+      _flatpak_running "$name" && running=true
+      # Flatpak owns ~/.var/app/<id>; --delete-data removes it with the app.
+      # It is emitted in the same "<verdict>\t<path>" form as the name-based
+      # walk so one loop below handles both sources.
+      path="$TIDY_HOME/.var/app/$name"
+      [ -e "$path" ] && leftovers="exact"$'\t'"$path"
+      ;;
+    *)
+      _pkg_category "$name"
+      category="$TIDY_UN_CATEGORY"
+      _tidy_load_meta
+      icon="${TIDY_ICON[$name]:-}"
+      lastused="${TIDY_LASTUSED[$name]:-0}"
+      _tidy_running "$name" && running=true
+      version="$(expac -Q '%v' "$name" 2>/dev/null)"
+      size="$(expac -Q '%m' "$name" 2>/dev/null)"
+      case "$size" in '' | *[!0-9]*) size=0 ;; esac
+      desc="$(expac -Q '%d' "$name" 2>/dev/null)"
+      deps="$(expac -Q '%D' "$name" 2>/dev/null | tr ' ' '\n' | sed '/^$/d' | sort -u | tr '\n' ' ')"
+      requiredBy="$(expac -Q '%N' "$name" 2>/dev/null | tr ' ' '\n' | sed '/^$/d' | sort -u | tr '\n' ' ')"
+      files="$(pacman -Qlq "$name" 2>/dev/null | _count_lines)"
+      leftovers="$(_leftover_paths "$name")"
+      # What `pacman -Rs` would take with it, so the warning can name the
+      # collateral up front instead of surprising the user afterwards.
+      plan="$(pacman -Rs --print --print-format '%n' "$name" 2>/dev/null | tr '\n' ' ')"
+      plan="$(printf '%s' "$plan" | sed 's/^ *//; s/ *$//')"
+      ;;
+  esac
+
+  # One walk over the leftovers gathers every number at once: the running total
+  # the header reports, and how much of it a restore point would cover.
+  while IFS=$'\t' read -r kind path; do
+    [ -n "$path" ] || continue
+    # A name-similar entry is not part of this removal; it is offered again by
+    # the scan once the app is gone, where the user can judge it.
+    if [ "$kind" = "near" ]; then
+      near_count=$((near_count + 1))
+      continue
+    fi
+    bytes="$(_path_bytes "$path")"
+    if _is_user_path "$path"; then scope="user"; else scope="system"; fi
+    lpaths+=("$path"); lbytes+=("$bytes"); lscope+=("$scope")
+    leftover_bytes=$((leftover_bytes + bytes))
+    _tidy_backupable "$path" && config_bytes=$((config_bytes + bytes))
+  done <<< "$leftovers"
+
+  if [ -n "$plan" ]; then
+    plan_count="$(printf '%s' "$plan" | wc -w)"
+  fi
+
+  printf '{"ok":true,"id":"%s","name":"%s","version":"%s","source":"%s","category":"%s","desc":"%s","remote":"%s","installation":"%s","packageBytes":%s,"ownedFiles":%s,"deps":"%s","requiredBy":"%s","leftoverBytes":%s,"leftoverNear":%s,"configBytes":%s,"plan":"%s","planCount":%s,"icon":"%s","lastUsed":%s,"running":%s,"leftovers":[' \
+    "$(_json_escape "$id")" "$(_json_escape "$display")" "$(_json_escape "$version")" \
+    "$source" "$category" "$(_json_escape "$desc")" "$(_json_escape "$remote")" \
+    "$(_json_escape "$install")" "$size" "$files" "$(_json_escape "$deps")" \
+    "$(_json_escape "$requiredBy")" "$leftover_bytes" "$near_count" "$config_bytes" \
+    "$(_json_escape "$plan")" "$plan_count" "$(_json_escape "$icon")" "$lastused" "$running"
+
+  local i
+  for i in "${!lpaths[@]}"; do
+    [ "$i" -eq 0 ] || printf ','
+    printf '{"path":"%s","bytes":%s,"scope":"%s"}' \
+      "$(_json_escape "${lpaths[$i]}")" "${lbytes[$i]}" "${lscope[$i]}"
+  done
+
+  printf ']}\n'
+}
+
+# ----------------------------------------------------------------------- run
+# Remove one package and every remnant of it, in a single elevated call so the
+# user authenticates once per package. The result lands in the R_* globals
+# rather than on stdout, because a batch is several of these followed by one
+# total.
+_run_one() {
+  local id="$1" shred="${2:-0}" force="${3:-0}"
+  _split_id "$id"
+  local source="$TIDY_UN_SOURCE" name="$TIDY_UN_NAME"
+  local inner="" user_paths="" sys_paths="" path freed=0 removed=0 leftover_bytes=0 sys_count=0
+  local pkg_ok=1 msg="" before=0 fail_msg="" undo_at="" kind="" near=0
+  local -a backup=()
+
+  R_STATE=err; R_BYTES=0; R_FILES=0; R_MSG=""
+
+  if ! _valid_app_name "$TIDY_UN_NAME"; then
+    R_MSG="invalid id"
+    return 0
+  fi
+
+  # A running application cannot be replaced cleanly: the removal reports
+  # success while the live copy keeps writing into the very configuration
+  # directories this pass is about to clear. Refusing is the only outcome that
+  # cannot corrupt anything, and the caller can override it deliberately.
+  if [ "$force" != 1 ]; then
+    if [ "$source" = "flatpak" ]; then
+      if _flatpak_running "$name"; then
+        R_MSG="$name is still running — quit it and try again"
+        return 0
+      fi
+    elif _tidy_running "$name"; then
+      R_MSG="$name is still running — quit it and try again"
+      return 0
+    fi
+  fi
+
+  # Measure before deleting: pacman forgets the installed size as soon as the
+  # package leaves the local database, so a post-run query would report 0.
+  case "$source" in
+    flatpak)
+      before="$(flatpak info --show-size "$name" 2>/dev/null)"
+      ;;
+    *)
+      before="$(expac -Q '%m' "$name" 2>/dev/null)"
+      ;;
+  esac
+  case "$before" in '' | *[!0-9]*) before=0 ;; esac
+
+  # A leftover is only a leftover if we know what this package's files were
+  # called. `pacman -Ql` answers for a package that is installed, and the token
+  # cache answers for one Tidy removed earlier; with neither, the names are
+  # nothing but guesses off the package name, and removing a guess means
+  # deleting any directory that happens to share it — `run pacman:Android` must
+  # never delete ~/Android. Refuse instead, and point at the reviewed scan.
+  local have_names=0
+  if [ "$source" = "flatpak" ]; then
+    have_names=1
+  elif pacman -Qi "$name" >/dev/null 2>&1; then
+    have_names=1
+  elif [ -s "$_TIDY_CACHE_DIR/$(_safe_id "$id").tokens" ]; then
+    have_names=1
+  fi
+  if [ "$have_names" != 1 ]; then
+    R_STATE=err
+    R_MSG="$(_json_escape "$name is not installed — there is nothing to remove")"
+    return 0
+  fi
+
+  # Remember what this package's files were called while pacman can still say
+  # so. The leftover scan runs afterwards, when `pacman -Ql` has nothing left to
+  # answer with, and a name it can no longer produce is a leftover it can no
+  # longer find.
+  _tidy_cache_tokens "$id" "$(_leftover_names "$name")"
+
+  # What to say when the removal does not go through. A refused removal has two
+  # very different causes — a real dependency refusal, and a dismissed password
+  # prompt — so the pacman branch below narrows this down before reporting.
+  if [ "$source" = "flatpak" ]; then
+    fail_msg="Removal failed — the flatpak could not be removed"
+  else
+    fail_msg="Removal failed — the package may be required by another package"
+  fi
+
+  # Pass one: work out what this package owns in the user's home without
+  # touching anything, so the restore point can be taken while it is all still
+  # there.
+  case "$source" in
+    flatpak)
+      # Flatpak has its own privilege handling. The app's own store is removed
+      # either way, but ~/.var/app/<id> is only cleared by --delete-data when
+      # flatpak runs as the user: elevated, HOME is /root, so the real home
+      # directory is queued as a leftover and cleared later.
+      if [ -e "$TIDY_HOME/.var/app/$name" ]; then
+        leftover_bytes="$(_path_bytes "$TIDY_HOME/.var/app/$name")"
+        user_paths+="$TIDY_HOME/.var/app/$name"$'\n'
+      fi
+      ;;
+    *)
+      while IFS=$'\t' read -r kind path; do
+        [ -n "$path" ] || continue
+        if [ "$kind" = "near" ]; then
+          near=$((near + 1))
+          continue
+        fi
+        leftover_bytes=$((leftover_bytes + $(_path_bytes "$path")))
+        if _is_user_path "$path"; then
+          user_paths+="$path"$'\n'
+        else
+          sys_paths+="$path"$'\n'
+          sys_count=$((sys_count + 1))
+        fi
+      done < <(_leftover_paths "$name")
+      ;;
+  esac
+
+  # The restore point is a copy of the configuration this removal is about to
+  # delete, so it is written before the package goes — and dropped again if the
+  # removal turns out not to happen.
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    _tidy_backupable "$path" && backup+=("$path")
+  done <<< "$user_paths"
+  if [ "${#backup[@]}" -gt 0 ]; then
+    undo_at="$(_undo_create "$id" "$name" "$source" "${backup[@]}")"
+  fi
+
+  # Pass two: remove the package.
+  case "$source" in
+    flatpak)
+      local fl_install=""
+      fl_install="$(flatpak list --app --columns=application,installation 2>/dev/null \
+        | awk -F'\t' -v app="$name" '$1 == app { print $2; exit }')"
+      if [ -z "$fl_install" ]; then
+        # The app is already gone but its data survived — an interrupted run,
+        # or the data was recreated. Clearing it now is the whole point of
+        # coming here, and it avoids a pointless password prompt.
+        pkg_ok=0
+        msg="Already uninstalled — clearing leftovers"
+      elif [ "$fl_install" = "system" ] && command -v pkexec >/dev/null 2>&1; then
+        pkexec flatpak uninstall --delete-data -y "$name" >/dev/null 2>&1 && pkg_ok=0
+      elif flatpak uninstall --delete-data -y "$name" >/dev/null 2>&1; then
+        pkg_ok=0
+      elif command -v pkexec >/dev/null 2>&1; then
+        pkexec flatpak uninstall --delete-data -y "$name" >/dev/null 2>&1 && pkg_ok=0
+      fi
+      [ "$pkg_ok" = 0 ] && [ -z "$msg" ] && msg="Flatpak removed"
+      ;;
+    *)
+      # Every step is chained with && so a refused removal never falls
+      # through to deleting that package's configuration directories.
+      inner="pacman -Rns --noconfirm $(printf '%q' "$name")"
+      while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        inner+=" && rm -rf -- $(printf '%q' "$path")"
+      done <<< "$sys_paths"
+      # Dependencies are left to -Rs: it already drops every dependency this
+      # package was the last reason for, recursively. A system-wide orphan
+      # sweep here would delete packages that have nothing to do with this
+      # app, so reclaiming strays stays in the Clean tab's Orphan cleaner.
+
+      if ! pacman -Qi "$name" >/dev/null 2>&1; then
+        # Already gone, but its configuration directories are still here.
+        pkg_ok=0
+        msg="Already removed — clearing leftovers"
+      elif command -v pkexec >/dev/null 2>&1; then
+        pkexec /usr/bin/bash -c "$inner" >/dev/null 2>&1 && pkg_ok=0
+      fi
+      [ "$pkg_ok" = 0 ] && [ -z "$msg" ] && msg="Package removed"
+      ;;
+  esac
+
+  if [ "$pkg_ok" = 0 ]; then
+    # User-space remnants never need root, but they are only touched when the
+    # package itself is really gone — cancelling the password prompt must not
+    # leave a stripped config behind for an app that is still installed.
+    while IFS= read -r path; do
+      [ -n "$path" ] || continue
+      [ -e "$path" ] || { removed=$((removed + 1)); continue; }
+      if [ "$shred" = 1 ]; then _tidy_wipe "$path"; fi
+      rm -rf -- "$path" 2>/dev/null && removed=$((removed + 1))
+    done <<< "$user_paths"
+    removed=$((removed + sys_count))
+    R_STATE=ok
+    R_BYTES=$((before + leftover_bytes))
+    R_FILES=$removed
+    R_MSG="${msg:-Removed}"
+    if [ "$near" -gt 0 ]; then
+      R_MSG="$R_MSG · $near similar path"
+      [ "$near" = 1 ] || R_MSG="${R_MSG}s"
+      R_MSG="$R_MSG left to review"
+    fi
+  else
+    _undo_drop "$undo_at"
+    # A refusal has two very different causes. pacman only reports "Required By"
+    # when something genuinely depends on the package; otherwise the prompt was
+    # most likely dismissed, and saying "required by another package" would send
+    # the user hunting for a dependency that does not exist.
+    if [ "$source" != "flatpak" ] && pacman -Qi "$name" >/dev/null 2>&1; then
+      local reqs=""
+      reqs="$(pacman -Qi "$name" 2>/dev/null | sed -n 's/^Required By *: *//p')"
+      case "$reqs" in
+        "" | "None") fail_msg="Removal failed — the password prompt was dismissed" ;;
+        *) fail_msg="Still required by: $reqs" ;;
+      esac
+    fi
+    R_STATE=err
+    R_MSG="$(_json_escape "$fail_msg")"
+  fi
+  return 0
+}
+
+# One or more ids. Each package keeps its own restore point and its own result
+# line — polkit caches the authorisation between them, so the user is asked
+# once — and a partial failure reports exactly which package failed and why.
+cmd_run() {
+  local shred=0 force=0 a ids=()
+  for a in "$@"; do
+    case "$a" in
+      --shred) shred=1 ;;
+      --force) force=1 ;;
+      *) [ -n "$a" ] && ids+=("$a") ;;
+    esac
+  done
+  TIDY_SHRED="$shred"
+
+  if [ "${#ids[@]}" -eq 0 ]; then
+    printf 'RESULT ? err 0 0 missing-id\n'
+    printf 'TOTAL 0 0\n'
+    return 1
+  fi
+
+  local id total_b=0 total_f=0 ok_csv="" label="" good=0
+  for id in "${ids[@]}"; do
+    _run_one "$id" "$shred" "$force"
+    printf 'RESULT %s %s %s %s %s\n' "$id" "$R_STATE" "$R_BYTES" "$R_FILES" "$R_MSG"
+    if [ "$R_STATE" = "ok" ]; then
+      total_b=$((total_b + R_BYTES))
+      total_f=$((total_f + R_FILES))
+      ok_csv="${ok_csv:+$ok_csv,}$id"
+      good=$((good + 1))
+      _split_id "$id"
+      if [ "$good" = 1 ]; then label="$TIDY_UN_NAME"; else label="$good apps"; fi
+    fi
+  done
+  printf 'TOTAL %s %s\n' "$total_b" "$total_f"
+
+  # One history line per run, not per package: a batch of five is one thing the
+  # person did, and the History tab should read "Freed 4.6 GB" once.
+  if [ "$good" -gt 0 ] && [ -x "$TIDY_STATE" ]; then
+    [ -n "$label" ] || label="apps"
+    "$TIDY_STATE" log uninstall "$total_b" "$total_f" "$ok_csv" "$label" >/dev/null 2>&1
+  fi
+  return 0
+}
+
+# ------------------------------------------------------------- leftover scan
+# By the time anyone asks what an application left behind, the package is
+# usually gone: `pacman -Ql` can no longer name a single one of its files and
+# expac has forgotten the package altogether. So the scan works from names —
+# the ones the application answers to, and the ones its files used to have,
+# which `run` caches a moment before it removes the package.
+
+_TIDY_CACHE_DIR="$TIDY_HOME/.cache/tidy/uninstall"
+
+_safe_id() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
+
+_tidy_cache_tokens() {
+  local id="$1" tokens="$2"
+  [ -n "$id" ] && [ -n "$tokens" ] || return 0
+  mkdir -p "$_TIDY_CACHE_DIR" 2>/dev/null || return 0
+  printf '%s\n' "$tokens" > "$_TIDY_CACHE_DIR/$(_safe_id "$id").tokens" 2>/dev/null || true
+}
+
+_tidy_cached_tokens() {
+  cat -- "$_TIDY_CACHE_DIR/$(_safe_id "$1").tokens" 2>/dev/null || true
+}
+
+# Words that match half the filesystem. Letting one through would bury the two
+# real leftovers under a hundred directories that merely share a name with the
+# app, so they are dropped before anything is searched.
+_TIDY_GENERIC_TOKENS="app apps bin sbin lib libs lib64 libexec share share2 config
+  conf cache local data state system dev src docs doc man man1 locale icons icon
+  fonts font desktop desktops gtk gtk2 gtk3 gtk4 qt qt5 qt6 kde gnome xfce udev
+  tmp temp log logs run etc usr var opt home root common core base test tests
+  plugin plugins theme themes script scripts include python site-packages"
+
+# The names an application goes by: the package name with the packaging
+# suffixes nobody says out loud, the display name as a directory would spell it,
+# for a flatpak the last segment of its id, and every name its files used to
+# have before the package was removed.
+_tidy_scan_tokens() {
+  local id="$1" display="$2"
+  _split_id "$id"
+  local source="$TIDY_UN_SOURCE" name="$TIDY_UN_NAME" tok out=""
+
+  tok="$name"
+  while :; do
+    case "$tok" in
+      *-bin | *-git | *-app | *-desktop | *-nightly | *-beta | *-stable | *-client | *-server | *-dev | *-devel)
+        tok="${tok%-*}" ;;
+      *) break ;;
+    esac
+  done
+  out="$name"$'\n'"$tok"$'\n'
+
+  [ "$source" = "flatpak" ] && out+="$(printf '%s' "${name##*.}")"$'\n'
+  [ -n "$display" ] && out+="$(printf '%s' "$display" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')"$'\n'
+  out+="$(_tidy_cached_tokens "$id")"$'\n'
+
+  printf '%s\n' "$out" | awk -v gen="$_TIDY_GENERIC_TOKENS" '
+    BEGIN { n = split(gen, g, /[ \t\n]+/); for (i = 1; i <= n; i++) if (g[i] != "") generic[g[i]] = 1 }
+    {
+      t = tolower($0)
+      gsub(/^[ \t]+|[ \t]+$/, "", t)
+      if (t == "") next
+      if (length(t) < 3) next
+      if (t in generic) next
+      if (seen[t]++) next
+      print t
+    }'
+}
+
+# Where an application may have written. Each root carries the shallowest depth
+# that still finds an app's own directory without walking the whole tree: the
+# home directory one level deep, /etc two, because a stray autostart entry lives
+# at /etc/xdg/autostart while a stray app directory lives at /etc/<app>.
+_tidy_scan_roots() {
+  printf '%s\t%s\n' \
+    "$TIDY_HOME" 1 \
+    "$TIDY_HOME/.cache" 1 \
+    "$TIDY_HOME/.config" 1 \
+    "$TIDY_HOME/.config/autostart" 1 \
+    "$TIDY_HOME/.config/systemd/user" 1 \
+    "$TIDY_HOME/.local/bin" 1 \
+    "$TIDY_HOME/.local/share" 1 \
+    "$TIDY_HOME/.local/state" 1 \
+    "$TIDY_HOME/.var/app" 1 \
+    /etc 2 \
+    /etc/systemd/system 1 \
+    /etc/xdg/autostart 1 \
+    /opt 1 \
+    /var/cache 1 \
+    /var/lib 2 \
+    /var/log 1 \
+    /var/tmp 1 \
+    /usr/lib 1 \
+    /usr/lib/systemd/system 1 \
+    /usr/local/lib 1 \
+    /usr/local/share/applications 1 \
+    /usr/share/applications 1 \
+    /usr/share/dbus-1/services 1 \
+    /usr/share/icons 1 \
+    /usr/share/pixmaps 1 \
+    /usr/share/polkit-1/actions 1 \
+    /usr/share/systemd/user 1
+}
+
+# Exact: the entry is the name, or the name with something appended or
+# prefixed to it. "android-studio" matches android-studio-helper and
+# google-android-studio alike, and never matches "android". A leading "lib" is
+# peeled off once, because a package installs /usr/lib/libfoo.so.1 for an app
+# called foo.
+_scan_exact() {
+  local base="${1,,}" tokens="$2" n
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    [ "$base" = "$n" ] && return 0
+    case "$base" in
+      "$n"[-._]* | *[-._]"$n" | "$n"[a-z0-9]*) return 0 ;;
+    esac
+    case "$base" in
+      lib?*)
+        case "${base#lib}" in
+          "$n" | "$n"[-._]* | *[-._]"$n") return 0 ;;
+        esac
+        ;;
+    esac
+  done <<< "$tokens"
+  return 1
+}
+
+# Fuzzy: the alphanumeric core of an entry contains the name's. This is what
+# finds ~/.config/Google/AndroidStudio2024.1 for android-studio, which is why
+# the UI never preselects a fuzzy hit — it is a guess, and it is shown as one.
+_scan_fuzzy() {
+  local base n
+  base="$(printf '%s' "${1,,}" | tr -cd 'a-z0-9')"
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    n="$(printf '%s' "$n" | tr -cd 'a-z0-9')"
+    [ "${#n}" -ge 6 ] || continue
+    case "$base" in *"$n"*) return 0 ;; esac
+  done <<< "$2"
+  return 1
+}
+
+# A path some package owns is that package's business — never a leftover. One
+# pacman call answers for the whole list, which is far cheaper than one call
+# per path.
+_owned_paths() {
+  [ "$#" -gt 0 ] || return 0
+  # pacman can only carry so many arguments at once; chunk the list so a
+  # large leftover set does not trip ARG_MAX and silently drop every owner.
+  local chunk=() p
+  for p in "$@"; do
+    chunk+=("$p")
+    if [ "${#chunk[@]}" -ge 32 ]; then
+      pacman -Qo -- "${chunk[@]}" 2>/dev/null | sed -n 's/ is owned by .*//p'
+      chunk=()
+    fi
+  done
+  if [ "${#chunk[@]}" -gt 0 ]; then
+    pacman -Qo -- "${chunk[@]}" 2>/dev/null | sed -n 's/ is owned by .*//p'
+  fi
+}
+
+cmd_scan() {
+  local id="$1" display="${2:-}"
+  _split_id "$id"
+  if ! _valid_app_name "$TIDY_UN_NAME"; then
+    printf '{"ok":false,"error":"invalid id"}\n'
+    return 2
+  fi
+  local tokens count_tokens
+  tokens="$(_tidy_scan_tokens "$id" "$display")"
+  count_tokens="$(printf '%s\n' "$tokens" | awk 'NF { n++ } END { print n + 0 }')"
+
+  local cands=() path base root depth
+  while IFS=$'\t' read -r root depth; do
+    [ -n "$root" ] && [ -d "$root" ] || continue
+    while IFS= read -r path; do
+      [ -n "$path" ] || continue
+      case "$path" in
+        # The roots themselves, Tidy's own tree, and Tidy's own cache.
+        "$root" | *omarchy/plugins* | "$TIDY_HOME/.cache/tidy") continue ;;
+      esac
+      base="${path##*/}"
+      if _scan_exact "$base" "$tokens"; then
+        cands+=("0"$'\t'"$path")
+      elif _scan_fuzzy "$base" "$tokens"; then
+        cands+=("1"$'\t'"$path")
+      fi
+    done < <(find "$root" -mindepth 1 -maxdepth "$depth" -printf '%p\n' 2>/dev/null)
+  done < <(_tidy_scan_roots)
+
+  # A path reachable from two roots is kept once, an exact hit outranks a fuzzy
+  # one, and the order is stable so the list does not jump between scans.
+  local list
+  list="$(printf '%s\n' "${cands[@]}" \
+    | awk -F'\t' '
+        $2 == "" { next }
+        { if (!($2 in rank) || $1 < rank[$2]) rank[$2] = $1 }
+        END { for (p in rank) print rank[p] "\t" p }
+      ' \
+    | sort -t$'\t' -k1,1 -k2,2)"
+
+  local paths=()
+  while IFS=$'\t' read -r base path; do
+    [ -n "$path" ] && paths+=("$path")
+  done <<< "$list"
+  local owned=""
+  [ "${#paths[@]}" -gt 0 ] && owned="$(_owned_paths "${paths[@]}")"
+
+  printf '{"ok":true,"id":"%s","name":"%s","tokens":%s,"items":[' \
+    "$(_json_escape "$id")" "$(_json_escape "$display")" "$count_tokens"
+
+  local total=0 found=0 first=1 bytes scope match
+  while IFS=$'\t' read -r match path; do
+    [ -n "$path" ] || continue
+    printf '%s\n' "$owned" | grep -qxF -- "$path" && continue
+    [ "$found" -ge 300 ] && break
+    bytes="$(_path_bytes "$path")"
+    if _is_user_path "$path"; then scope="user"; else scope="system"; fi
+    [ "$match" = "0" ] && match="exact" || match="fuzzy"
+    [ "$first" = 1 ] || printf ','
+    first=0
+    total=$((total + bytes))
+    found=$((found + 1))
+    printf '{"path":"%s","bytes":%s,"scope":"%s","match":"%s"}' \
+      "$(_json_escape "$path")" "$bytes" "$scope" "$match"
+  done <<< "$list"
+
+  printf '],"bytes":%s,"found":%s}\n' "$total" "$found"
+}
+
+# ---------------------------------------------------------------- wipe paths
+# Deletes the leftovers the person ticked on the scan screen. That list comes
+# over the wire from the UI, so nothing here trusts it: a path must sit strictly
+# inside a directory an application is allowed to write to, must not itself be
+# one of those directories, and must not be owned by any installed package.
+# Anything else is refused, whatever the caller believes it is sending.
+
+_tidy_wipe_allowed() {
+  local p="$1" root
+  # `..` walks back out of any root and a trailing slash makes `rm -rf` follow a
+  # symlink, so both are turned away before the roots are even consulted.
+  case "$p" in
+    "" | *..*) return 1 ;;
+    */) return 1 ;;
+  esac
+  # First, the path must not be a root at all, nor an ancestor of one. A root
+  # (or a directory holding one, such as ~/.local around ~/.local/share) is the
+  # place leftovers are searched for; removing it would delete the search space
+  # itself. This has to be a separate pass because roots nest: ~/.config is a
+  # root, but it also sits inside the $HOME root, so an "is it inside a root"
+  # test alone answers yes for it.
+  while IFS=$'\t' read -r root _; do
+    [ -n "$root" ] || continue
+    case "$root" in
+      "$p" | "$p"/*) return 1 ;;
+    esac
+  done < <(_tidy_scan_roots)
+  # Only then may the path be picked up as something strictly inside a root.
+  while IFS=$'\t' read -r root _; do
+    [ -n "$root" ] || continue
+    case "$p" in
+      "$root"/*) return 0 ;;
+    esac
+  done < <(_tidy_scan_roots)
+  return 1
+}
+
+cmd_wipe() {
+  local shred=0 rmmode=0 p args=()
+  for p in "$@"; do
+    case "$p" in
+      --shred) shred=1 ;;
+      --rm) rmmode=1 ;;
+      *) args+=("$p") ;;
+    esac
+  done
+  if [ "${#args[@]}" -eq 0 ]; then
+    printf 'RESULT wipe err 0 0 nothing-to-remove\n'
+    printf 'TOTAL 0 0\n'
+    return 1
+  fi
+
+  local user_list=() sys_list=() keep_sys=() refused=0 owned=""
+  for p in "${args[@]}"; do
+    if ! _tidy_wipe_allowed "$p"; then refused=$((refused + 1)); continue; fi
+    if _is_user_path "$p"; then user_list+=("$p"); else sys_list+=("$p"); fi
+  done
+
+  if [ "${#sys_list[@]}" -gt 0 ]; then
+    owned="$(_owned_paths "${sys_list[@]}")"
+    for p in "${sys_list[@]}"; do
+      if printf '%s\n' "$owned" | grep -qxF -- "$p"; then refused=$((refused + 1)); continue; fi
+      keep_sys+=("$p")
+    done
+  fi
+
+  local bytes=0 count=0 trashed=0
+  for p in "${user_list[@]}" "${keep_sys[@]}"; do
+    bytes=$((bytes + $(_path_bytes "$p")))
+  done
+
+  # User-space leftovers go to the desktop trash rather than into the void. A
+  # leftover is a guess, and a guess the user disagrees with should still be
+  # recoverable from their file manager. --shred and --rm override that.
+  for p in "${user_list[@]}"; do
+    [ -e "$p" ] || { count=$((count + 1)); continue; }
+    if [ "$shred" = 1 ]; then
+      TIDY_SHRED=1
+      _tidy_wipe "$p"
+    elif [ "$rmmode" = 0 ] && _tidy_trash "$p"; then
+      trashed=$((trashed + 1))
+      count=$((count + 1))
+      continue
+    fi
+    rm -rf -- "$p" 2>/dev/null && count=$((count + 1))
+  done
+
+  if [ "${#keep_sys[@]}" -gt 0 ]; then
+    # One elevated call for every system path, chained with && so a refused
+    # prompt deletes none of them rather than some of them.
+    local inner=""
+    for p in "${keep_sys[@]}"; do
+      inner+="rm -rf -- $(printf '%q' "$p") && "
+    done
+    inner="${inner% && }"
+    if ! command -v pkexec >/dev/null 2>&1; then
+      printf 'RESULT wipe err 0 0 no polkit agent\n'
+      printf 'TOTAL 0 0\n'
+      return 1
+    fi
+    if pkexec /usr/bin/bash -c "$inner" >/dev/null 2>&1; then
+      count=$((count + ${#keep_sys[@]}))
+    else
+      printf 'RESULT wipe err 0 0 Removal failed - the password prompt was dismissed\n'
+      printf 'TOTAL 0 0\n'
+      return 1
+    fi
+  fi
+
+  local msg
+  if [ "$trashed" -gt 0 ]; then
+    msg="$trashed moved to the Trash"
+    [ "$count" -gt "$trashed" ] && msg="$msg, $((count - trashed)) removed"
+  else
+    msg="Removed $count leftover"
+    [ "$count" = 1 ] || msg="${msg}s"
+  fi
+  [ "$refused" -gt 0 ] && msg="$msg - $refused kept, not ours to delete"
+  printf 'RESULT wipe ok %s %s %s\n' "$bytes" "$count" "$msg"
+  printf 'TOTAL %s %s\n' "$bytes" "$count"
+}
+
+# ---------------------------------------------------------------------- main
+case "${1:-}" in
+  list) cmd_list ;;
+  preview)
+    [ -n "${2:-}" ] || { echo '{"ok":false,"error":"missing id"}'; exit 2; }
+    cmd_preview "$2"
+    ;;
+  run)
+    shift
+    [ "$#" -gt 0 ] || { echo 'RESULT ? err 0 0 missing-id'; exit 2; }
+    cmd_run "$@"
+    ;;
+  scan)
+    [ -n "${2:-}" ] || { echo '{"ok":false,"error":"missing id"}'; exit 2; }
+    cmd_scan "$2" "${3:-}"
+    ;;
+  wipe)
+    shift
+    cmd_wipe "$@"
+    ;;
+  *)
+    echo "usage: tidy-uninstall list|preview <id>|run <id>... [--shred] [--force]|scan <id> [name]|wipe [--shred|--rm] <path>..." >&2
+    exit 2
+    ;;
+esac

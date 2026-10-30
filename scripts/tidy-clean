@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+# tidy-clean — destructive pass (or dry run) for the Tidy plugin.
+#
+#   tidy-clean [--preview] [--shred] <cleaner-id>...
+#
+# Emits one line per cleaner plus a total, designed for tidy stdout parsing:
+#
+#   RESULT <id> <ok|preview|skip|err> <bytes> <files> <message>
+#   TOTAL <bytes> <files>
+#
+# User cleaners run directly. System cleaners are batched into a single
+# `pkexec bash -c` call so Omarchy's in-shell polkit agent asks for the
+# password once, no matter how many system cleaners are selected.
+
+set -uo pipefail
+
+PREVIEW=0
+SHRED=0
+SAFE=0
+NOTIFY=0
+# What the run calls itself in the history log. The timer leaves this empty so
+# it stays `auto`; the one-click button in the panel says `--as clean`, because
+# "you pressed a button" and "the timer ran overnight" are different facts and
+# the history should not have to guess.
+MODE_AS=""
+IDS=()
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --preview) PREVIEW=1 ;;
+    --shred) SHRED=1 ;;
+    --safe) SAFE=1 ;;
+    --notify) NOTIFY=1 ;;
+    --as) MODE_AS="${2:-}"; if [ $# -ge 2 ]; then shift; fi ;;
+    -*) echo "RESULT _ err 0 0 unknown-flag:$1"; exit 2 ;;
+    *) IDS+=("$1") ;;
+  esac
+  shift
+done
+
+DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+LIB="$DIR/tidy-lib.sh"
+# shellcheck source=tidy-lib.sh
+. "$LIB"
+
+# The one-click button and the background timer both ask for the same thing:
+# the conservative set, no password, nothing that cannot be regenerated.
+if [ "$SAFE" = 1 ]; then
+  IDS=()
+  for id in $TIDY_SAFE_CLEANERS; do IDS+=("$id"); done
+fi
+
+# Only the three modes the history knows how to render. A typo must not put a
+# row in the log that the History tab then has to invent a label for.
+case "$MODE_AS" in
+  clean|auto|uninstall) : ;;
+  *) MODE_AS="" ;;
+esac
+
+if [ "${#IDS[@]}" -eq 0 ]; then
+  echo "RESULT _ err 0 0 no-cleaners-selected"
+  exit 2
+fi
+
+export TIDY_SHRED="$SHRED"
+
+USER_IDS=()
+SYS_IDS=()
+for id in "${IDS[@]}"; do
+  case " $TIDY_CLEANERS " in
+    *" $id "*) ;;
+    *)
+      echo "RESULT $id err 0 0 unknown-cleaner"
+      continue
+      ;;
+  esac
+  if [ "$(tidy_kind "$id")" = "system" ]; then
+    SYS_IDS+=("$id")
+  else
+    USER_IDS+=("$id")
+  fi
+done
+
+TOTAL_B=0
+TOTAL_F=0
+DID=0
+add_total() {
+  TOTAL_B=$((TOTAL_B + ${1:-0}))
+  TOTAL_F=$((TOTAL_F + ${2:-0}))
+}
+
+# What a cleaner reports as freed has to be what actually went away. Several
+# of them only trim (paccache keeps one version per package, the journal keeps
+# seven days), so the pre-clean size is an upper bound, not a result. Measure
+# again afterwards and report the difference.
+_freed_of() {
+  local id="$1" before="$2" after
+  after="$("measure_$id" 2>/dev/null)"
+  after="${after:-0}"
+  case "$after" in '' | *[!0-9]*) after=0 ;; esac
+  local freed=$((before - after))
+  [ "$freed" -lt 0 ] && freed=0
+  echo "$freed"
+}
+
+# ---------------------------------------------------------------------------
+# user cleaners — run as the invoking user
+# ---------------------------------------------------------------------------
+for id in "${USER_IDS[@]}"; do
+  bytes="$("measure_$id" 2>/dev/null)"
+  files="$("files_$id" 2>/dev/null)"
+  avail="$("avail_$id" 2>/dev/null)"
+  bytes="${bytes:-0}"
+  files="${files:-0}"
+  avail="${avail:-1}"
+
+  ok="${avail%% *}"
+  reason=""
+  if [ "$avail" != "$ok" ]; then reason="${avail#* }"; fi
+
+  if [ "$ok" != "1" ]; then
+    printf 'RESULT %s skip 0 0 %s\n' "$id" "$(_json_escape "${reason:-unavailable}")"
+    continue
+  fi
+
+  if [ "$PREVIEW" = 1 ]; then
+    printf 'RESULT %s preview %s %s dry-run\n' "$id" "$bytes" "$files"
+    add_total "$bytes" "$files"
+    continue
+  fi
+
+  if "clean_$id" >/dev/null 2>&1; then
+    freed="$(_freed_of "$id" "$bytes")"
+    printf 'RESULT %s ok %s %s cleaned\n' "$id" "$freed" "$files"
+    add_total "$freed" "$files"
+    DID=$((DID + 1))
+  else
+    printf 'RESULT %s err 0 0 failed\n' "$id"
+  fi
+done
+
+# ---------------------------------------------------------------------------
+# system cleaners — one privilege escalation for the whole batch
+#
+# Preview never elevates: a dry run must not ask for a password, so system
+# cleaners report the unprivileged measurements the scan already produced.
+# ---------------------------------------------------------------------------
+if [ "${#SYS_IDS[@]}" -gt 0 ]; then
+  if [ "$PREVIEW" = 1 ]; then
+    for id in "${SYS_IDS[@]}"; do
+      bytes="$("measure_$id" 2>/dev/null)"
+      files="$("files_$id" 2>/dev/null)"
+      avail="$("avail_$id" 2>/dev/null)"
+      bytes="${bytes:-0}"
+      files="${files:-0}"
+      avail="${avail:-1}"
+      ok="${avail%% *}"
+      reason=""
+      if [ "$avail" != "$ok" ]; then reason="${avail#* }"; fi
+      if [ "$ok" != "1" ]; then
+        printf 'RESULT %s skip 0 0 %s\n' "$id" "$(_json_escape "${reason:-unavailable}")"
+      else
+        printf 'RESULT %s preview %s %s dry-run\n' "$id" "$bytes" "$files"
+        add_total "$bytes" "$files"
+      fi
+    done
+  else
+    sys_ids_str="$(printf '%q ' "${SYS_IDS[@]}")"
+    inner="LIB=\"$LIB\"
+. \"\$LIB\"
+for id in $sys_ids_str; do
+  b=\"\$(\"measure_\$id\" 2>/dev/null)\"; b=\"\${b:-0}\"
+  case \"\$b\" in '' | *[!0-9]*) b=0 ;; esac
+  f=\"\$(\"files_\$id\" 2>/dev/null)\"; f=\"\${f:-0}\"
+  if \"clean_\$id\" >/dev/null 2>&1; then
+    a=\"\$(\"measure_\$id\" 2>/dev/null)\"; a=\"\${a:-0}\"
+    case \"\$a\" in '' | *[!0-9]*) a=0 ;; esac
+    d=\$((b - a)); [ \"\$d\" -lt 0 ] && d=0
+    printf 'RESULT %s ok %s %s cleaned\\n' \"\$id\" \"\$d\" \"\$f\"
+  else
+    printf 'RESULT %s err 0 0 failed\\n' \"\$id\"
+  fi
+done"
+
+    out=""
+    rc=127
+    if command -v pkexec >/dev/null 2>&1; then
+      out="$(pkexec /usr/bin/bash -c "$inner" 2>/dev/null)"
+      rc=$?
+    fi
+
+    if [ "$rc" -ne 0 ] || [ -z "$out" ]; then
+      if [ "$rc" -eq 126 ]; then
+        msg="authorisation dismissed"
+      elif [ "$rc" -eq 127 ]; then
+        msg="no polkit agent"
+      else
+        msg="admin step failed"
+      fi
+      for id in "${SYS_IDS[@]}"; do
+        printf 'RESULT %s err 0 0 %s\n' "$id" "$msg"
+      done
+    else
+      while IFS= read -r line; do
+        case "$line" in
+          RESULT\ *)
+            echo "$line"
+            st="$(printf '%s' "$line" | awk '{ print $3 }')"
+            if [ "$st" = "ok" ] || [ "$st" = "preview" ]; then
+              add_total "$(printf '%s' "$line" | awk '{ print $4 + 0 }')" \
+                "$(printf '%s' "$line" | awk '{ print $5 + 0 }')"
+              [ "$st" = "ok" ] && DID=$((DID + 1))
+            fi
+            ;;
+        esac
+      done <<<"$out"
+    fi
+  fi
+fi
+
+printf 'TOTAL %s %s\n' "$TOTAL_B" "$TOTAL_F"
+
+# A run worth remembering gets remembered: the History tab and the undo list
+# are the same store, and the timer's notification is the only feedback a
+# background clean ever gets.
+if [ "$PREVIEW" = 0 ] && [ "$TOTAL_B" -gt 0 ]; then
+  ids_csv=""
+  for id in "${IDS[@]}"; do ids_csv="${ids_csv:+$ids_csv,}$id"; done
+  if [ -n "$MODE_AS" ]; then mode="$MODE_AS"; elif [ "$SAFE" = 1 ]; then mode="auto"; else mode="clean"; fi
+  [ -x "$TIDY_STATE" ] && "$TIDY_STATE" log "$mode" "$TOTAL_B" "$TOTAL_F" "$ids_csv" "" >/dev/null 2>&1
+
+  if [ "$NOTIFY" = 1 ] && command -v notify-send >/dev/null 2>&1; then
+    body="Freed $(_tidy_human "$TOTAL_B")"
+    [ "$DID" -gt 1 ] && body="$body across $DID cleaners"
+    notify-send -a Tidy -i drive-harddisk "Tidy" "$body" >/dev/null 2>&1
+  fi
+fi
+
+exit 0

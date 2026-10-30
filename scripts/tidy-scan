@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# tidy-scan — read-only measurement pass. Emits one JSON object on stdout:
+#
+#   {"ok":true,"items":{"<id>":{"bytes":N,"files":N,"available":1,"reason":""},...}}
+#
+# Sizes for root-only paths are approximations: this runs unprivileged, so a
+# few directories (core dumps, /tmp atime) may under-report. tidy-clean
+# re-measures as root, and the panel re-scans after a run for real numbers.
+
+set -uo pipefail
+
+DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=tidy-lib.sh
+. "$DIR/tidy-lib.sh"
+
+printf '{"ok":true,"items":{'
+first=1
+for id in $TIDY_CLEANERS; do
+  bytes="$("measure_"$id"" 2>/dev/null)"
+  files="$("files_"$id"" 2>/dev/null)"
+  avail="$("avail_"$id"" 2>/dev/null)"
+  bytes="${bytes:-0}"
+  files="${files:-0}"
+  avail="${avail:-1}"
+
+  ok="${avail%% *}"
+  reason=""
+  if [ "$avail" != "$ok" ]; then reason="${avail#* }"; fi
+  case "$ok" in 0 | 1) ;; *) ok=1 ;; esac
+  case "$bytes" in '' | *[!0-9]*) bytes=0 ;; esac
+  case "$files" in '' | *[!0-9]*) files=0 ;; esac
+
+  [ "$first" -eq 1 ] || printf ','
+  first=0
+  printf '"%s":{"bytes":%s,"files":%s,"available":%s,"reason":"%s"}' \
+    "$id" "$bytes" "$files" "$ok" "$(_json_escape "$reason")"
+done
+printf '}}\n'

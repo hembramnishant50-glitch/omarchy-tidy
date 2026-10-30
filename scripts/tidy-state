@@ -1,0 +1,521 @@
+#!/usr/bin/env python3
+# tidy-state — everything Tidy remembers between runs.
+#
+#   tidy-state history [--limit N]      what was reclaimed, newest first
+#   tidy-state log <mode> <bytes> <files> <ids|-> [label]
+#   tidy-state ignore-list [--raw]      paths Tidy must never touch
+#   tidy-state ignore-add <path>...
+#   tidy-state ignore-del <path>
+#   tidy-state undo-list                restore points the uninstaller kept
+#   tidy-state undo-create <id> <name> <source> <path>...
+#   tidy-state undo-restore <at>        put an application back
+#   tidy-state undo-drop <at>
+#   tidy-state space [path] [depth]     one-level du breakdown, for Space
+#   tidy-state disk [path]              free space, for the bar indicator
+#
+# One file, one format: <state dir>/state.json. Writes go through a temporary
+# file and a rename so a crash mid-write cannot leave a half-file that would
+# make the next read throw away the whole history.
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+HOME = os.environ.get("TIDY_HOME") or os.environ.get("HOME") or "/root"
+STATE_DIR = os.environ.get("TIDY_STATE_DIR") or os.path.join(HOME, ".local", "share", "tidy")
+STATE = os.path.join(STATE_DIR, "state.json")
+UNDO_DIR = os.path.join(STATE_DIR, "undo")
+
+# A restore point is a courtesy, not a backup service: past this much source
+# data the uninstaller says so and moves on rather than quietly filling the
+# disk with a copy of somebody's Steam library.
+def _env_int(name, default):
+    try:
+        return int(os.environ.get(name) or default)
+    except (TypeError, ValueError):
+        return default
+
+UNDO_MAX = _env_int("TIDY_UNDO_MAX", 268435456)      # 256 MiB
+HISTORY_MAX = _env_int("TIDY_HISTORY_MAX", 200)
+UNDO_KEEP = _env_int("TIDY_UNDO_KEEP", 40)
+
+
+# --------------------------------------------------------------------- state
+def load():
+    try:
+        with open(STATE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data["version"] = 1
+    for key in ("history", "ignore", "undo"):
+        if not isinstance(data.get(key), list):
+            data[key] = []
+    return data
+
+
+def save(data):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = STATE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, separators=(",", ":"))
+    os.replace(tmp, STATE)
+
+
+def out(obj):
+    json.dump(obj, sys.stdout, separators=(",", ":"))
+    sys.stdout.write("\n")
+
+
+def num(value, fallback=0):
+    try:
+        return int(value)
+    except Exception:
+        return fallback
+
+
+# ------------------------------------------------------------------- helpers
+def du_bytes(path):
+    """Apparent size, matching the `du -sb` the shell side uses."""
+    try:
+        res = subprocess.run(
+            ["du", "-sb", "--", path],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=120,
+        )
+        text = res.stdout.decode("utf-8", "replace").strip()
+        lines = [line for line in text.splitlines() if line.strip()]
+        if not lines:
+            return 0
+        token = lines[-1].split()[0] if lines[-1].split() else ""
+        return num(token)
+    except Exception:
+        return 0
+
+
+def run(argv, timeout=600):
+    try:
+        res = subprocess.run(
+            argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
+        )
+        return res.returncode, res.stdout.decode("utf-8", "replace").strip()
+    except Exception as exc:
+        return 1, str(exc)
+
+
+def safe_id(text):
+    keep = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+    return "".join(ch if ch in keep else "_" for ch in text)
+
+
+def prune_history(data):
+    data["history"] = data["history"][-HISTORY_MAX:]
+
+
+def prune_undo(data):
+    """Drop the oldest restore points and their archives."""
+    if len(data["undo"]) <= UNDO_KEEP:
+        return
+    keep = data["undo"][-UNDO_KEEP:]
+    for entry in data["undo"][: len(data["undo"]) - UNDO_KEEP]:
+        drop_archive(entry)
+    data["undo"] = keep
+
+
+def drop_archive(entry):
+    archive = entry.get("archive") or ""
+    if not archive:
+        return
+    path = archive if os.path.isabs(archive) else os.path.join(UNDO_DIR, archive)
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+# ------------------------------------------------------------------- history
+def cmd_history(args):
+    limit = 40
+    if "--limit" in args:
+        idx = args.index("--limit")
+        if idx + 1 < len(args):
+            limit = max(1, num(args[idx + 1], 40))
+    data = load()
+    entries = data["history"][-limit:][::-1]
+    out({
+        "ok": True,
+        "runs": len(data["history"]),
+        "totalBytes": sum(num(e.get("bytes")) for e in data["history"]),
+        "entries": entries,
+    })
+
+
+def cmd_log(args):
+    if len(args) < 4:
+        out({"ok": False, "error": "usage: log <mode> <bytes> <files> <ids> [label]"})
+        return 2
+    mode = args[0]
+    ids_raw = args[3]
+    ids = [] if ids_raw in ("", "-") else [p for p in ids_raw.split(",") if p]
+    entry = {
+        "at": int(time.time()),
+        "mode": mode,
+        "bytes": num(args[1]),
+        "files": num(args[2]),
+        "ids": ids,
+    }
+    if len(args) > 4 and args[4]:
+        entry["label"] = args[4]
+    data = load()
+    data["history"].append(entry)
+    prune_history(data)
+    save(data)
+    out({"ok": True, "at": entry["at"]})
+
+
+def cmd_history_clear():
+    data = load()
+    data["history"] = []
+    save(data)
+    out({"ok": True})
+
+
+# -------------------------------------------------------------------- ignore
+def cmd_ignore_list(args):
+    data = load()
+    paths = data["ignore"]
+    if "--raw" in args:
+        for path in paths:
+            sys.stdout.write(path + "\n")
+        return 0
+    out({"ok": True, "paths": paths})
+    return 0
+
+
+def cmd_ignore_add(args):
+    if not args:
+        out({"ok": False, "error": "missing path"})
+        return 2
+    data = load()
+    added = []
+    for raw in args:
+        path = raw
+        while len(path) > 1 and path.endswith("/"):
+            path = path[:-1]
+        while "//" in path:
+            path = path.replace("//", "/")
+        if not path.startswith("/"):
+            continue
+        if path in ("/", HOME, os.path.dirname(HOME)):
+            continue
+        if path not in data["ignore"]:
+            data["ignore"].append(path)
+            added.append(path)
+    data["ignore"].sort()
+    save(data)
+    out({"ok": True, "added": added, "paths": data["ignore"]})
+    return 0
+
+
+def cmd_ignore_del(args):
+    if not args:
+        out({"ok": False, "error": "missing path"})
+        return 2
+    target = args[0]
+    data = load()
+    data["ignore"] = [p for p in data["ignore"] if p != target]
+    save(data)
+    out({"ok": True, "paths": data["ignore"]})
+    return 0
+
+
+# ---------------------------------------------------------------------- undo
+def cmd_undo_list():
+    data = load()
+    entries = []
+    for entry in data["undo"][::-1]:
+        item = dict(entry)
+        archive = entry.get("archive") or ""
+        path = archive if os.path.isabs(archive) else os.path.join(UNDO_DIR, archive)
+        try:
+            item["archiveBytes"] = os.path.getsize(path)
+            item["available"] = True
+        except OSError:
+            item["archiveBytes"] = 0
+            item["available"] = False
+        entries.append(item)
+    out({"ok": True, "entries": entries})
+
+
+def cmd_undo_create(args):
+    if len(args) < 4:
+        out({"ok": False, "error": "usage: undo-create <id> <name> <source> <path>..."})
+        return 2
+    ident, name, source = args[0], args[1], args[2]
+    candidates = args[3:]
+
+    keep = []
+    skipped = 0
+    total = 0
+    cache_root = os.path.join(HOME, ".cache")
+    for raw in candidates:
+        path = raw.rstrip("/")
+        if not path or not os.path.exists(path):
+            continue
+        # Caches are regenerable and routinely gigabytes; a restore point for
+        # them would cost more than the application did. Config, state and app
+        # data are what people actually miss.
+        if path == cache_root or path.startswith(cache_root + "/"):
+            skipped += 1
+            continue
+        if not path.startswith(HOME + "/"):
+            skipped += 1
+            continue
+        keep.append(path)
+        total += du_bytes(path)
+
+    if not keep:
+        out({"ok": True, "archive": "", "bytes": 0, "paths": [], "skipped": skipped})
+        return 0
+
+    if total > UNDO_MAX:
+        out({
+            "ok": False,
+            "reason": "too-large",
+            "bytes": total,
+            "paths": keep,
+            "skipped": skipped,
+        })
+        return 0
+
+    os.makedirs(UNDO_DIR, exist_ok=True)
+    stamp = int(time.time())
+    base = "%d-%s" % (stamp, safe_id(ident))
+    archive = base + ".tar.zst"
+    target = os.path.join(UNDO_DIR, archive)
+    rels = [p[len(HOME) + 1:] for p in keep]
+    if not shutil.which("tar"):
+        out({"ok": False, "reason": "no-tar", "bytes": total, "paths": keep, "skipped": skipped})
+        return 0
+
+    argv = ["tar", "-C", HOME]
+    if shutil.which("zstd"):
+        argv += ["--zstd"]
+    else:
+        argv += ["-z"]
+        archive = base + ".tar.gz"
+        target = os.path.join(UNDO_DIR, archive)
+    argv += ["-cf", target, "--"] + rels
+
+    code, _ = run(argv, timeout=900)
+    if code != 0 or not os.path.exists(target):
+        out({"ok": False, "reason": "archive-failed", "bytes": total, "paths": keep, "skipped": skipped})
+        return 0
+
+    entry = {
+        "at": stamp,
+        "id": ident,
+        "name": name,
+        "source": source,
+        "archive": archive,
+        "bytes": total,
+        "archiveBytes": os.path.getsize(target),
+        "paths": keep,
+    }
+    data = load()
+    data["undo"].append(entry)
+    prune_undo(data)
+    save(data)
+    out({"ok": True, "at": stamp, "archive": archive, "bytes": total,
+         "paths": keep, "skipped": skipped})
+    return 0
+
+
+def find_undo(data, key):
+    for entry in data["undo"]:
+        if str(entry.get("at")) == str(key):
+            return entry
+    return None
+
+
+def cmd_undo_restore(args):
+    if not args:
+        out({"ok": False, "error": "missing restore point"})
+        return 2
+    data = load()
+    entry = find_undo(data, args[0])
+    if entry is None:
+        out({"ok": False, "error": "no such restore point"})
+        return 1
+
+    archive = entry.get("archive") or ""
+    path = archive if os.path.isabs(archive) else os.path.join(UNDO_DIR, archive)
+    messages = []
+
+    # Reinstall first, restore files second: the package manager writes its
+    # default configuration, and the archived copy then lands on top of it.
+    ident = entry.get("id") or ""
+    source = entry.get("source") or "pacman"
+    name = entry.get("name") or ""
+    pkg = ident.split(":", 1)[1] if ":" in ident else name
+    reinstalled = False
+    if pkg:
+        if source == "flatpak":
+            if shutil.which("flatpak"):
+                code, _ = run(["flatpak", "install", "-y", "flathub", pkg], timeout=1800)
+                reinstalled = code == 0
+        elif shutil.which("pacman"):
+            if shutil.which("pkexec"):
+                code, _ = run(["pkexec", "/usr/bin/pacman", "-S", "--noconfirm", "--needed", pkg], timeout=1800)
+            else:
+                code, _ = run(["pacman", "-S", "--noconfirm", "--needed", pkg], timeout=1800)
+            reinstalled = code == 0
+        messages.append("package reinstalled" if reinstalled else "package not reinstalled")
+
+    restored = 0
+    if os.path.exists(path) and shutil.which("tar"):
+        argv = ["tar", "-C", HOME, "-xf", path]
+        code, _ = run(argv, timeout=900)
+        restored = len(entry.get("paths") or []) if code == 0 else 0
+        messages.append("files restored" if code == 0 else "file restore failed")
+    else:
+        messages.append("no archive to restore from")
+
+    ok = reinstalled or restored > 0
+    if ok:
+        drop_archive(entry)
+        data["undo"] = [e for e in data["undo"] if e is not entry]
+        save(data)
+
+    out({"ok": ok, "id": ident, "name": name, "reinstalled": reinstalled,
+         "restored": restored, "message": ", ".join(messages)})
+    return 0 if ok else 1
+
+
+def cmd_undo_drop(args):
+    if not args:
+        out({"ok": False, "error": "missing restore point"})
+        return 2
+    data = load()
+    entry = find_undo(data, args[0])
+    if entry is None:
+        out({"ok": False, "error": "no such restore point"})
+        return 1
+    drop_archive(entry)
+    data["undo"] = [e for e in data["undo"] if e is not entry]
+    save(data)
+    out({"ok": True})
+    return 0
+
+
+# --------------------------------------------------------------------- space
+def cmd_space(args):
+    """A one-level du breakdown, for the Space tab.
+
+    `-x` keeps the walk on a single filesystem: descending from $HOME into a
+    mounted backup drive is exactly how a "where did it go" screen turns into
+    a ten-minute hang.
+    """
+    path = args[0] if args and args[0] else HOME
+    depth = num(args[1], 1) if len(args) > 1 else 1
+    if depth < 1:
+        depth = 1
+    if depth > 3:
+        depth = 3
+    if not os.path.isdir(path):
+        out({"ok": False, "error": "not a directory: %s" % path})
+        return 1
+
+    code, text = run(
+        ["du", "-x", "-B1", "-d%d" % depth, "--", path], timeout=180,
+    )
+    if code != 0 and not text:
+        out({"ok": False, "error": "du failed for %s" % path})
+        return 1
+
+    root = path.rstrip("/") or "/"
+    total = 0
+    items = []
+    child_total = 0
+    for line in text.splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) != 2:
+            continue
+        size = num(parts[0])
+        entry = parts[1].rstrip("/") or "/"
+        if entry == root:
+            total = size
+            continue
+        # Only the immediate children of the requested path; deeper rows come
+        # back as the caller drills in with another `space` call.
+        parent = os.path.dirname(entry) or "/"
+        if parent != root:
+            continue
+        items.append({"name": os.path.basename(entry), "path": entry, "bytes": size})
+        child_total += size
+    if total <= 0:
+        total = child_total
+    items.sort(key=lambda item: item["bytes"], reverse=True)
+    out({"ok": True, "path": path, "depth": depth, "total": total, "items": items})
+    return 0
+
+
+# ---------------------------------------------------------------------- disk
+def cmd_disk(args):
+    path = args[0] if args else "/"
+    if not os.path.exists(path):
+        path = HOME
+    try:
+        stat = os.statvfs(path)
+    except OSError as exc:
+        out({"ok": False, "error": str(exc)})
+        return 1
+    block = stat.f_frsize
+    total = block * stat.f_blocks
+    free = block * stat.f_bavail
+    used = total - block * stat.f_bfree
+    pct = round(used * 100.0 / total) if total else 0
+    out({"ok": True, "path": path, "total": total, "used": used, "free": free, "pct": pct})
+    return 0
+
+
+# ---------------------------------------------------------------------- main
+def main(argv):
+    if not argv:
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    verb, rest = argv[0], argv[1:]
+    if verb == "history":
+        return cmd_history(rest)
+    if verb == "history-clear":
+        return cmd_history_clear()
+    if verb == "log":
+        return cmd_log(rest)
+    if verb == "ignore-list":
+        return cmd_ignore_list(rest)
+    if verb == "ignore-add":
+        return cmd_ignore_add(rest)
+    if verb == "ignore-del":
+        return cmd_ignore_del(rest)
+    if verb == "undo-list":
+        return cmd_undo_list()
+    if verb == "undo-create":
+        return cmd_undo_create(rest)
+    if verb == "undo-restore":
+        return cmd_undo_restore(rest)
+    if verb == "undo-drop":
+        return cmd_undo_drop(rest)
+    if verb == "space":
+        return cmd_space(rest)
+    if verb == "disk":
+        return cmd_disk(rest)
+    print("unknown command: %s" % verb, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
