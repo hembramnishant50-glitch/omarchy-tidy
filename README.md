@@ -24,7 +24,7 @@ Tidy is an Omarchy bar widget + panel plugin that knows where the megabytes are 
 | Slot | What you see |
 |:---:|:---|
 | **Bar widget** | Reclaimable space + a one-click **Safe Clean** button |
-| **Clean tab** | 20 grouped cleaners, preview or run, with live totals |
+| **Clean tab** | 24 grouped cleaners, preview or run, with live totals |
 | **Apps tab** | Scan your system and uninstall packages with real disk accounting |
 | **Space tab** | Root-level disk overview at a glance |
 | **History tab** | Every run logged, with undo where it's possible |
@@ -59,11 +59,14 @@ Tidy is an Omarchy bar widget + panel plugin that knows where the megabytes are 
 | Cleaner | Removes | Guard rails |
 |:---|:---|:---|
 | **Firefox / Chromium / Brave / Helium** | web, code and GPU caches | Bookmarks, logins, sessions stay |
+| **Zen / LibreWolf** | Gecko-style cache folders (`cache2`, `startupCache`, thumbnails) | Bookmarks, logins, sessions stay |
+| **Tor Browser** | Download and update staging only | The updater's `.gpg` signature is kept |
 | **mise cache** | Downloaded tool archives + its npm package store | Installed toolchains in `~/.local/share/mise` are never touched |
 | **npm cache** | `~/.npm/_cacache` + npx cache | Packages re-fetch when next needed |
 | **Android Studio** | IDE index caches | **Auto-skipped while the IDE is open** |
 | **Docker** | Stopped containers, dangling images, build cache | Named volumes are kept unless you ask |
 | **Flatpak** | Runtimes and apps nothing depends on | Opt-out dependencies are honoured |
+| **File index caches** | Desktop indexer (`tracker3`) database + media cache | Opt-in by default — a clean costs a full reindex |
 
 ## 🔒 Safety by design
 
