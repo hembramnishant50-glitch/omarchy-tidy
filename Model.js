@@ -123,6 +123,26 @@ var CLEANERS = [
     desc: "Delete the desktop file-indexer's database and media cache (tracker3). Files are re-indexed on the next pass."
   },
   {
+    id: "misetools", group: "apps", label: "mise toolchains", glyph: "\uf0ad",
+    kind: "user", defaultOn: true, safe: true,
+    desc: "Remove installed tool versions nothing references anymore. Versions your configs require, and tools currently running, are kept."
+  },
+  {
+    id: "ayugram", group: "apps", label: "AyuGram media cache", glyph: "\uf267",
+    kind: "user", defaultOn: true, safe: true,
+    desc: "Delete Telegram media and image caches. Media re-downloads from the cloud when next viewed; login state stays. Skipped while AyuGram is open."
+  },
+  {
+    id: "omarchycache", group: "apps", label: "Omarchy widget caches", glyph: "\uf0e2",
+    kind: "user", defaultOn: true, safe: true,
+    desc: "Delete wallpaper and theme selection thumbnail caches. Thumbnails rebuild on next use."
+  },
+  {
+    id: "chromheadless", group: "apps", label: "Headless temp", glyph: "\uf3a5",
+    kind: "user", defaultOn: true, safe: true,
+    desc: "Delete leftover chromium-headless scratch profiles. Skipped while a headless browser runs."
+  },
+  {
     id: "mise", group: "apps", label: "mise cache", glyph: "\uf013",
     kind: "user", defaultOn: true, safe: true,
     desc: "Delete mise's downloaded tool archives and package store. Installed toolchains are untouched; anything a project needs is re-downloaded on demand."

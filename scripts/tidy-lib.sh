@@ -9,13 +9,13 @@
 #
 # Ids must match CLEANERS in ../Model.js.
 
-TIDY_CLEANERS="journal pkgcache orphans coredumps tmp trash thumbnails yaycache recent omarchy clipboard firefox chromium brave helium zen torbrowser librewolf mise npm androidstudio tracker docker flatpak"
+TIDY_CLEANERS="journal pkgcache orphans coredumps tmp trash thumbnails yaycache recent omarchy clipboard firefox chromium brave helium zen torbrowser librewolf mise npm androidstudio tracker misetools ayugram omarchycache chromheadless docker flatpak"
 
 # The conservative set: none of these need root, and none of them hold
 # anything that is not rebuilt on demand. This is what the one-click button
 # and the background timer run — a scheduled job cannot answer a polkit
 # prompt, and "free up some space" is not consent to lose the clipboard.
-TIDY_SAFE_CLEANERS="trash thumbnails yaycache recent omarchy firefox chromium brave helium zen torbrowser librewolf mise npm androidstudio"
+TIDY_SAFE_CLEANERS="trash thumbnails yaycache recent omarchy firefox chromium brave helium zen torbrowser librewolf mise npm androidstudio misetools ayugram omarchycache chromheadless"
 
 TIDY_LIB_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 TIDY_STATE="$TIDY_LIB_DIR/tidy-state"
@@ -725,6 +725,133 @@ avail_tracker() {
 clean_tracker() {
   _tidy_wipe "$(_tracker_root)"
   _clear_dir "$(_tracker_root)"
+}
+
+# ---------------------------------------------------------------------------
+# Applications — unused mise toolchains
+# ---------------------------------------------------------------------------
+# ~/.local/share/mise/installs keeps every version ever installed. mise's
+# own `prune --tools` decides what is unused: it checks every tracked config
+# (so required versions stay) and skips versions running processes are
+# still using — safer than this script guessing. The dry run doubles as the
+# honest meter; its detail lines go to stderr and print "~"-prefixed paths.
+_misetools_pruned_paths() {
+  mise prune --dry-run --tools 2>&1 |
+    sed -n 's/.*[[:space:]]remove[[:space:]]//p' |
+    sed "s|^~|$HOME/|" |
+    sort -u
+}
+measure_misetools() {
+  command -v mise >/dev/null 2>&1 || { echo 0; return; }
+  _misetools_pruned_paths | sum_bytes_lines
+}
+files_misetools() {
+  command -v mise >/dev/null 2>&1 || { echo 0; return; }
+  mise prune --dry-run --tools 2>&1 | grep -c " is prunable: "
+}
+avail_misetools() {
+  command -v mise >/dev/null 2>&1 || { echo "0 mise not installed"; return; }
+  if [ -d "$TIDY_HOME/.local/share/mise" ]; then
+    echo 1
+  else
+    echo "0 no mise data dir"
+  fi
+}
+clean_misetools() {
+  command -v mise >/dev/null 2>&1 || return 1
+  # --yes: without a TTY mise refuses to prune ("nobody to ask") and exits
+  # silently, pruning nothing — which used to report ok with zero freed.
+  mise prune --tools --yes >/dev/null 2>&1
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Applications — AyuGram (Telegram) media cache
+# ---------------------------------------------------------------------------
+# Telegram re-downloads previews and images from the cloud when next
+# viewed, so media_cache and cache under tdata/user_data are only disk
+# fat. Login state (tdata root files and the databases) is never touched.
+_ayugram_user_data() { echo "$TIDY_HOME/.local/share/AyuGramDesktop/tdata/user_data"; }
+# Bracket trick keeps this grep from matching its own command line.
+_ayugram_running() { pgrep -f 'Ayu[G]ram' >/dev/null 2>&1; }
+_ayugram_caches() {
+  for d in "$(_ayugram_user_data)/media_cache" "$(_ayugram_user_data)/cache"; do
+    [ -d "$d" ] && echo "$d"
+  done
+}
+measure_ayugram() { _ayugram_caches | sum_bytes_lines; }
+files_ayugram() {
+  local n=0 d
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    n=$((n + $(find "$d" -type f 2>/dev/null | _count_lines)))
+  done < <(_ayugram_caches)
+  echo "$n"
+}
+avail_ayugram() {
+  if [ -d "$(_ayugram_user_data)" ]; then
+    if _ayugram_running; then echo "0 AyuGram is open"; return; fi
+    echo 1
+  else
+    echo "0 AyuGram not installed"
+  fi
+}
+clean_ayugram() {
+  local d
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    _tidy_wipe "$d"
+    _clear_dir "$d"
+  done < <(_ayugram_caches)
+}
+
+# ---------------------------------------------------------------------------
+# Applications — Omarchy widget caches
+# ---------------------------------------------------------------------------
+# Omarchy's widgets keep thumbnail caches (wallpaper image selector, theme
+# selector) regenerated on demand. The keybinding record and agent-usage
+# files in the same directory are state, not cache, and stay.
+measure_omarchycache() {
+  _glob_bytes "$TIDY_HOME/.cache/omarchy/image-selector" "$TIDY_HOME/.cache/omarchy/theme-selector"
+}
+files_omarchycache() {
+  local n=0 d
+  for d in "$TIDY_HOME/.cache/omarchy/image-selector" "$TIDY_HOME/.cache/omarchy/theme-selector"; do
+    [ -d "$d" ] && n=$((n + $(find "$d" -type f 2>/dev/null | _count_lines)))
+  done
+  echo "$n"
+}
+avail_omarchycache() {
+  if [ -d "$TIDY_HOME/.cache/omarchy" ]; then echo 1; else echo "0 no omarchy cache"; fi
+}
+clean_omarchycache() {
+  _tidy_wipe "$TIDY_HOME/.cache/omarchy/image-selector" "$TIDY_HOME/.cache/omarchy/theme-selector"
+  _clear_dir "$TIDY_HOME/.cache/omarchy/image-selector" "$TIDY_HOME/.cache/omarchy/theme-selector"
+}
+
+# ---------------------------------------------------------------------------
+# Applications — chromium-headless leftovers
+# ---------------------------------------------------------------------------
+# Chromium's headless mode dumps temp scoped_dir* profiles into
+# ~/.cache/chromium-headless and does not always reap them. The whole dir
+# is scratch space; skipped while a headless instance is running.
+_chromheadless_root() { echo "$TIDY_HOME/.cache/chromium-headless"; }
+_chromheadless_running() { pgrep -f 'chrom[i]um-headless|headl[e]ss_shell' >/dev/null 2>&1; }
+measure_chromheadless() { _path_bytes "$(_chromheadless_root)"; }
+files_chromheadless() {
+  find "$(_chromheadless_root)" -mindepth 1 -maxdepth 1 2>/dev/null | _count_lines
+}
+avail_chromheadless() {
+  if [ -d "$(_chromheadless_root)" ]; then
+    if _chromheadless_running; then echo "0 a headless browser is running"; return; fi
+    echo 1
+  else
+    echo "0 no chromium-headless cache"
+  fi
+}
+clean_chromheadless() {
+  _tidy_wipe "$(_chromheadless_root)"
+  _clear_dir "$(_chromheadless_root)"
 }
 
 # ---------------------------------------------------------------------------

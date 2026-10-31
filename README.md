@@ -24,7 +24,7 @@ Tidy is an Omarchy bar widget + panel plugin that knows where the megabytes are 
 | Slot | What you see |
 |:---:|:---|
 | **Bar widget** | Reclaimable space + a one-click **Safe Clean** button |
-| **Clean tab** | 24 grouped cleaners, preview or run, with live totals |
+| **Clean tab** | 28 grouped cleaners, preview or run, with live totals |
 | **Apps tab** | Scan your system and uninstall packages with real disk accounting |
 | **Space tab** | Root-level disk overview at a glance |
 | **History tab** | Every run logged, with undo where it's possible |
@@ -67,6 +67,10 @@ Tidy is an Omarchy bar widget + panel plugin that knows where the megabytes are 
 | **Docker** | Stopped containers, dangling images, build cache | Named volumes are kept unless you ask |
 | **Flatpak** | Runtimes and apps nothing depends on | Opt-out dependencies are honoured |
 | **File index caches** | Desktop indexer (`tracker3`) database + media cache | Opt-in by default — a clean costs a full reindex |
+| **mise toolchains** | Installed tool versions no config references anymore (`mise prune --tools --yes`) | Required versions and tools currently running are kept |
+| **AyuGram media cache** | Telegram's media and image caches | Media re-downloads when next viewed; login state never touched; skipped while AyuGram is open |
+| **Omarchy widget caches** | Wallpaper/theme selector thumbnail caches | Thumbnails rebuild on next use; keybinding records kept |
+| **Headless temp** | Leftover chromium-headless `scoped_dir*` profiles | Skipped while a headless browser runs |
 
 ## 🔒 Safety by design
 
