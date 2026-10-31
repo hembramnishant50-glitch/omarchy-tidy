@@ -9,13 +9,13 @@
 #
 # Ids must match CLEANERS in ../Model.js.
 
-TIDY_CLEANERS="journal pkgcache orphans coredumps tmp trash thumbnails yaycache recent omarchy clipboard firefox chromium brave helium mise npm androidstudio docker flatpak"
+TIDY_CLEANERS="journal pkgcache orphans coredumps tmp trash thumbnails yaycache recent omarchy clipboard firefox chromium brave helium zen torbrowser librewolf mise npm androidstudio tracker docker flatpak"
 
 # The conservative set: none of these need root, and none of them hold
 # anything that is not rebuilt on demand. This is what the one-click button
 # and the background timer run — a scheduled job cannot answer a polkit
 # prompt, and "free up some space" is not consent to lose the clipboard.
-TIDY_SAFE_CLEANERS="trash thumbnails yaycache recent omarchy firefox chromium brave helium mise npm androidstudio"
+TIDY_SAFE_CLEANERS="trash thumbnails yaycache recent omarchy firefox chromium brave helium zen torbrowser librewolf mise npm androidstudio"
 
 TIDY_LIB_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 TIDY_STATE="$TIDY_LIB_DIR/tidy-state"
@@ -652,6 +652,80 @@ avail_helium() {
   fi
 }
 clean_helium() { clean_browser_root "$(_helium_root)"; }
+
+# ---------------------------------------------------------------------------
+# Applications — Gecko-family browser caches (Zen, LibreWolf, Tor Browser)
+# ---------------------------------------------------------------------------
+# Firefox forks cache under lowercase dirs (cache2, startupCache,
+# thumbnails) instead of the chromium-style names, so they need their own
+# dir finder. The base Firefox deal (~/.cache/mozilla) is already covered
+# by the firefox cleaner above; only the forks need this helper.
+_gecko_cache_dirs() {
+  local root="$1"
+  [ -d "$root" ] || return 0
+  find "$root" -maxdepth 4 -type d \
+    \( -name cache2 -o -name startupCache -o -name thumbnails \) 2>/dev/null \
+    | _tidy_filter_ignored
+}
+clean_gecko_root() {
+  local d
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    _tidy_wipe "$d"
+    rm -rf -- "$d" 2>/dev/null
+  done <<<"$(_gecko_cache_dirs "$1")"
+  return 0
+}
+
+_zen_root() { echo "$TIDY_HOME/.cache/zen"; }
+measure_zen() { _gecko_cache_dirs "$(_zen_root)" | sum_bytes_lines; }
+files_zen() { _gecko_cache_dirs "$(_zen_root)" | _count_lines; }
+avail_zen() {
+  if [ -d "$(_zen_root)" ]; then echo 1; else echo "0 Zen not installed"; fi
+}
+clean_zen() { clean_gecko_root "$(_zen_root)"; }
+
+_librewolf_root() { echo "$TIDY_HOME/.cache/librewolf"; }
+measure_librewolf() { _gecko_cache_dirs "$(_librewolf_root)" | sum_bytes_lines; }
+files_librewolf() { _gecko_cache_dirs "$(_librewolf_root)" | _count_lines; }
+avail_librewolf() {
+  if [ -d "$(_librewolf_root)" ]; then echo 1; else echo "0 LibreWolf not installed"; fi
+}
+clean_librewolf() { clean_gecko_root "$(_librewolf_root)"; }
+
+# Tor Browser: only the update/download staging area. The .gpg bundle
+# signature next to it is kept so the updater keeps its verification chain.
+_torbrowser_dir() { echo "$TIDY_HOME/.cache/torbrowser/download"; }
+measure_torbrowser() { _path_bytes "$(_torbrowser_dir)"; }
+files_torbrowser() {
+  find "$(_torbrowser_dir)" -mindepth 1 -maxdepth 1 2>/dev/null | _count_lines
+}
+avail_torbrowser() {
+  if [ -d "$TIDY_HOME/.cache/torbrowser" ]; then echo 1; else echo "0 Tor Browser not installed"; fi
+}
+clean_torbrowser() {
+  _tidy_wipe "$(_torbrowser_dir)"
+  _clear_dir "$(_torbrowser_dir)"
+}
+
+# ---------------------------------------------------------------------------
+# Applications — desktop file index (tracker)
+# ---------------------------------------------------------------------------
+# ~/.cache/tracker3 holds the file-indexer's database and extracted media
+# cache. Deleting it means a reindex on next mining pass — noticeable but
+# harmless, so this one is opt-in rather than part of the safe set.
+_tracker_root() { echo "$TIDY_HOME/.cache/tracker3"; }
+measure_tracker() { _path_bytes "$(_tracker_root)"; }
+files_tracker() {
+  find "$(_tracker_root)" -mindepth 1 -maxdepth 1 2>/dev/null | _count_lines
+}
+avail_tracker() {
+  if [ -d "$(_tracker_root)" ]; then echo 1; else echo "0 no tracker cache"; fi
+}
+clean_tracker() {
+  _tidy_wipe "$(_tracker_root)"
+  _clear_dir "$(_tracker_root)"
+}
 
 # ---------------------------------------------------------------------------
 # Applications — mise tool cache

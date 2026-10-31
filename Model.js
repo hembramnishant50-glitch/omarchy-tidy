@@ -103,6 +103,26 @@ var CLEANERS = [
     desc: "Delete Helium's web, code and GPU caches. Bookmarks and logins stay."
   },
   {
+    id: "zen", group: "apps", label: "Zen cache", glyph: "\uf06c",
+    kind: "user", defaultOn: true, safe: true,
+    desc: "Delete the Zen browser's cache folders. Bookmarks, logins and sessions stay."
+  },
+  {
+    id: "torbrowser", group: "apps", label: "Tor Browser cache", glyph: "\uf070",
+    kind: "user", defaultOn: true, safe: true,
+    desc: "Clear Tor Browser's download and update staging. Keeps the signature file the updater needs to verify."
+  },
+  {
+    id: "librewolf", group: "apps", label: "LibreWolf cache", glyph: "\uf1d0",
+    kind: "user", defaultOn: true, safe: true,
+    desc: "Delete LibreWolf's cache folders. Bookmarks, logins and sessions stay."
+  },
+  {
+    id: "tracker", group: "apps", label: "File index caches", glyph: "\uf1c0",
+    kind: "user", defaultOn: false,
+    desc: "Delete the desktop file-indexer's database and media cache (tracker3). Files are re-indexed on the next pass."
+  },
+  {
     id: "mise", group: "apps", label: "mise cache", glyph: "\uf013",
     kind: "user", defaultOn: true, safe: true,
     desc: "Delete mise's downloaded tool archives and package store. Installed toolchains are untouched; anything a project needs is re-downloaded on demand."
