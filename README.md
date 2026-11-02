@@ -2,14 +2,14 @@
 
 # 🧹 Tidy
 
-**A BleachBit-style system cleaner for [Omarchy](https://omarchy.org).**
+**A BleachBit-style system cleaner for [Omarchy](https://omarchy.org)**
 
 *Reclaim disk space from logs, caches, packages and leftovers — honestly measured, carefully guarded, one click away.*
 
 [![Version](https://img.shields.io/badge/version-1.0.0-blue)](https://github.com/hembramnishant50-glitch/omarchy-tidy)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Omarchy%20%7C%20Arch%20Linux-red)](https://omarchy.org)
-[![Language](https://img.shields.io/badge/shell-bash%20%2B%20QML-yellow)](#architecture)
+[![Language](https://img.shields.io/badge/language-bash%20%2B%20QML-yellow)](#-architecture)
 
 </div>
 
@@ -17,11 +17,11 @@
 
 ## ✨ What it does
 
-Tidy is an Omarchy bar widget + panel plugin that knows where the megabytes are hiding — pacman's package cache, the systemd journal, browser caches, AUR build leftovers, npm/mise tool stores, Docker and Flatpak dead weight — and cleans only what is safe to delete, showing you the *honest* number of bytes before and after.
+Tidy is an Omarchy **bar widget + panel plugin** that knows where the megabytes are hiding — pacman's package cache, the systemd journal, browser caches, AUR build leftovers, npm/mise tool stores, Docker and Flatpak dead weight — and cleans only what is safe to delete, showing you the **honest** number of bytes before and after.
 
-<div align="center">
+It ships five surfaces inside one card:
 
-| Slot | What you see |
+| 🎯 Slot | What you see |
 |:---:|:---|
 | **Bar widget** | Reclaimable space + a one-click **Safe Clean** button |
 | **Clean tab** | 28 grouped cleaners, preview or run, with live totals |
@@ -29,21 +29,21 @@ Tidy is an Omarchy bar widget + panel plugin that knows where the megabytes are 
 | **Space tab** | Root-level disk overview at a glance |
 | **History tab** | Every run logged, with undo where it's possible |
 
-</div>
+---
 
-## 🛠 The cleaners
+## 🧰 The cleaners
 
-### System (runs via one `pkexec` prompt for the whole batch)
+### 🖥️ System — runs via **one** `pkexec` prompt for the whole batch
 
 | Cleaner | Removes | Keeps |
 |:---|:---|:---|
 | **Journal logs** | System logs older than 7 days | The last week |
-| **Package cache** | Old versions of installed packages **+ archives of packages you've uninstalled** (`paccache -rk1` + `-ruk0`) | One version of every installed package — rollback stays possible |
+| **Package cache** | Old versions of installed packages **+** archives of packages you've uninstalled (`paccache -rk1` + `-ruk0`) | One version of every installed package — rollback stays possible |
 | **Orphan packages** | Dependencies nothing needs any more | Opt-in, never automatic |
 | **Crash dumps** | `systemd-coredump` and `/var/crash` | — |
 | **Stale temp files** | `/tmp` entries older than 7 days | Anything recent |
 
-### User (runs as you, no password)
+### 👤 User — runs as you, no password
 
 | Cleaner | Removes |
 |:---|:---|
@@ -54,42 +54,49 @@ Tidy is an Omarchy bar widget + panel plugin that knows where the megabytes are 
 | **Omarchy leftovers** | Stale `.bak` config backups |
 | **Clipboard history** | Saved clipboard entries and copied images (opt-in) |
 
-### Applications
+### 🧩 Applications — caches & leftovers
 
 | Cleaner | Removes | Guard rails |
 |:---|:---|:---|
-| **Firefox / Chromium / Brave / Helium** | web, code and GPU caches | Bookmarks, logins, sessions stay |
+| **Firefox / Chromium / Brave / Helium** | Web, code and GPU caches | Bookmarks, logins, sessions stay |
 | **Zen / LibreWolf** | Gecko-style cache folders (`cache2`, `startupCache`, thumbnails) | Bookmarks, logins, sessions stay |
 | **Tor Browser** | Download and update staging only | The updater's `.gpg` signature is kept |
 | **mise cache** | Downloaded tool archives + its npm package store | Installed toolchains in `~/.local/share/mise` are never touched |
+| **mise toolchains** | Installed tool versions nothing references anymore (`mise prune --tools --yes`) | Required versions and tools currently running are kept |
 | **npm cache** | `~/.npm/_cacache` + npx cache | Packages re-fetch when next needed |
 | **Android Studio** | IDE index caches | **Auto-skipped while the IDE is open** |
 | **Docker** | Stopped containers, dangling images, build cache | Named volumes are kept unless you ask |
 | **Flatpak** | Runtimes and apps nothing depends on | Opt-out dependencies are honoured |
+| **AyuGram media cache** | Telegram's media and image caches | Re-downloads when next viewed; login state never touched; skipped while AyuGram is open |
 | **File index caches** | Desktop indexer (`tracker3`) database + media cache | Opt-in by default — a clean costs a full reindex |
-| **mise toolchains** | Installed tool versions no config references anymore (`mise prune --tools --yes`) | Required versions and tools currently running are kept |
-| **AyuGram media cache** | Telegram's media and image caches | Media re-downloads when next viewed; login state never touched; skipped while AyuGram is open |
 | **Omarchy widget caches** | Wallpaper/theme selector thumbnail caches | Thumbnails rebuild on next use; keybinding records kept |
-| **Headless temp** | Leftover chromium-headless `scoped_dir*` profiles | Skipped while a headless browser runs |
+| **Headless temp** | Leftover `chromium-headless` `scoped_dir*` profiles | Skipped while a headless browser runs |
+
+---
 
 ## 🔒 Safety by design
 
 - **Previews first** — every cleaner has a dry run; `tidy-clean --preview` asks for zero passwords and deletes nothing.
-- **The Safe set** — the one-click button and the overnight timer only ever run cleaners that need no root and hold nothing but regenerable data (`TIDY_SAFE_CLEANERS`). A scheduled job can never answer a polkit prompt, and *"free up some space"* is not consent to lose the clipboard.
-- **One password, whole batch** — system cleaners are collected and executed in a single `pkexec bash -c`, so Omarchy's in-shell polkit agent prompts exactly once no matter how many system cleaners you selected.
+- **The Safe set** — the one-click button and the overnight timer only ever run cleaners that need no root and hold nothing but regenerable data (`TIDY_SAFE_CLEANERS`).
+- **One password, whole batch** — system cleaners are collected and executed in a single `pkexec bash -c`, so the polkit agent prompts exactly once no matter how many system cleaners you selected.
 - **Honest accounting** — sizes are measured before *and* after; what a run reports as freed is what actually went away. A clean 4 GB package cache reports `0 bytes`, not `4 GB`.
 - **Undo where possible** — the history log carries an undo list so recent deletions can be restored.
 - **Shred option** — `--shred` overwrites files before unlinking for the paranoid.
 
+---
+
 ## 📦 Install
 
 ```bash
-git clone https://github.com/hembramnishant50-glitch/omarchy-tidy ~/.config/omarchy/plugins/nishant.tidy
+git clone https://github.com/hembramnishant50-glitch/omarchy-tidy \
+  ~/.config/omarchy/plugins/nishant.tidy
 # then: pick Tidy in your bar widget settings (may need to restart the shell)
 ```
 
-Dependencies: `bash`, `python3`, `pacman`, `polkit`/`pkexec` — all standard on Omarchy.
-Optional: `expac`, `docker`, `flatpak`, `mise`, `npm`.
+**Dependencies:** `bash`, `python3`, `pacman`, `polkit`/`pkexec` — all standard on Omarchy.  
+**Optional:** `expac`, `docker`, `flatpak`, `mise`, `npm`.
+
+---
 
 ## ⌨️ CLI
 
@@ -118,7 +125,9 @@ tidy-schedule status
 tidy-schedule enable 03:00 daily
 ```
 
-## 🧬 Architecture
+---
+
+## 🏛️ Architecture
 
 ```
 ┌─────────────────── Omarchy shell ───────────────────┐
@@ -129,9 +138,9 @@ tidy-schedule enable 03:00 daily
 ┌──────────────▼──────────────────────────────────────┐
 │  scripts/                                            │
 │   tidy-scan      read-only measurement → JSON        │
-│   tidy-clean     dry-run/decryptive pass → RESULT lines│
-│   tidy-uninstall package scanner / uninstaller        │
-│   tidy-state     history + undo store (Python)        │
+│   tidy-clean     dry-run pass → RESULT lines         │
+│   tidy-uninstall package scanner / uninstaller       │
+│   tidy-state     history + undo store (Python)       │
 │   tidy-schedule  auto-clean timer                     │
 │   tidy-lib.sh    all cleaner definitions, one per id  │
 └──────────────────────────────────────────────────────┘
@@ -139,17 +148,35 @@ tidy-schedule enable 03:00 daily
 
 Every cleaner is four small bash functions: `measure_`, `files_`, `avail_` (with a human-readable reason when it can't run) and `clean_`. Adding a cleaner is adding one stanza; the panel, the scheduler and the history find it automatically.
 
+---
+
 ## ❓ FAQ
 
-**Is the Safe Clean really safe to run unattended?**
+<details>
+<summary><b>Is the Safe Clean really safe to run unattended?</b></summary>
+
 Yes — it never elevates, only touches regenerable caches, and the scheduler uses exactly that set by default.
 
-**Why did my package cache show 4 GB that a clean never freed?**
+</details>
+
+<details>
+<summary><b>Why did my package cache show 4 GB that a clean never freed?</b></summary>
+
 Because the raw directory size isn't the reclaimable size — pacman deliberately keeps one copy of every installed package. Tidy measures the *deletable* share via `paccache` dry runs, so the number you see is the number you get.
 
-**Can I add my own cleaner?**
+</details>
+
+<details>
+<summary><b>Can I add my own cleaner?</b></summary>
+
 Copy a stanza in `scripts/tidy-lib.sh`, add four functions, register the id in `TIDY_CLEANERS` (and `Model.js` for the UI row). That's it.
+
+</details>
+
+---
 
 ## 📄 License
 
 [MIT](LICENSE) — free to use, hack, and fork.
+
+</div>
