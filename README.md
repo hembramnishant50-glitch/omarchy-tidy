@@ -88,8 +88,7 @@ It ships five surfaces inside one card:
 ## 📦 Install
 
 ```bash
-git clone https://github.com/hembramnishant50-glitch/omarchy-tidy \
-  ~/.config/omarchy/plugins/nishant.tidy
+omarchy plugin add https://github.com/hembramnishant50-glitch/omarchy-tidy --enable
 # then: pick Tidy in your bar widget settings (may need to restart the shell)
 ```
 
